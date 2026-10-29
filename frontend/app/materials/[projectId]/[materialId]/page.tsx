@@ -2,7 +2,7 @@
 
 import { use, useEffect, useState } from 'react';
 
-type Material = { id: string; filename: string; warning: string };
+type Material = { id: string; filename: string; display_name?: string; warning: string };
 type Page = { text: string; next_offset: number | null; total_characters: number };
 
 export default function MaterialPreview({ params }: { params: Promise<{ projectId: string; materialId: string }> }) {
@@ -42,7 +42,7 @@ export default function MaterialPreview({ params }: { params: Promise<{ projectI
   }
 
   return <main className="proposal-preview-page">
-    <header><div><span className="eyebrow">QI SHU · 资料原文</span><h1>{material?.filename || '查看资料'}</h1><p>可关闭此页面，回到方案预览。</p></div></header>
+    <header><div><span className="eyebrow">QI SHU · 资料原文</span><h1>{material?.display_name || material?.filename || '查看资料'}</h1><p>可关闭此页面，回到方案预览。</p></div></header>
     {error && <div className="notice" role="status">{error}</div>}
     <section>
       {loading ? <p>正在读取资料……</p> : material ? <>

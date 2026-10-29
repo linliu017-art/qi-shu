@@ -17,21 +17,32 @@ from typing import Literal
 from .database import Base, DATA_DIR, SessionLocal, engine
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
-from .models import AdditionalCitation, AnalysisTask, Baseline, BaselineFacts, BaselineQuestions, ExtractedFact, FactReview, FactReviewEvent, Material, MaterialOriginal, ModelConsent, OpenQuestion, Project, ProposalDraft, ProposalExportEvent, ProposalReviewEvent, ProposalRevision, QuestionDecision, Requirement, RequirementDecision, TaskAttempt, TaskAttemptTiming, TaskConfig, TaskPricing, TaskSegment, new_id
+from .models import AdditionalCitation, AnalysisTask, Baseline, BaselineFacts, BaselineQuestions, ExtractedFact, FactReview, FactReviewEvent, Material, MaterialOriginal, MaterialVersion, MaterialLabel, MaterialStateEvent, ManualRequirement, ManualRequirementEvent, RequirementRevisionSuggestion, MembershipEvent, ModelConsent, OpenQuestion, Project, ProposalDraft, ProposalInputSource, ProposalExportEvent, ProposalPricing, ProposalReviewEvent, ProposalRevision, ProposalOutline, ProposalOutlineLink, QuestionDecision, QueuedJob, Requirement, RequirementDecision, SectionEdit, ConsistencyCheck, ConsistencyIssue, TaskAttempt, TaskAttemptTiming, TaskConfig, TaskModelChange, TaskPricing, TaskSegment, UserAccount, new_id, now
 from .parsing import ParseError, parse_content
 from .analysis import align_quote, execute_task, split_offsets
 from .proposal import run_proposal
+from .section_edit import sections, valid_candidate, run_section_edit
+from .consistency import run_consistency_check
+from .outline import OutlineChapter, default_chapters, validate_chapters
 from .proposal_review import SourceCheckError, questions_for, source_snapshot
 from .proposal_docx import build_docx
+from .document_render import DocumentRenderError, render_word_pdf
+from .authorization import can_access
+from .membership import initialize_project_owner, member_role
+from .security_context import actor_id, multiuser
+from .task_queue import enqueue
+from .project_lifecycle import current_state
+from .model_settings import model_key, model_settings
+from .navigation import NavigationInterpretInput, NavigationInterpretOutput, NavigationModelError, interpret_navigation
 import json
+import re
 import os
 import hashlib
 import sqlite3
 from uuid import uuid4
 from decimal import Decimal
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def migrate_database():
     root = Path(__file__).resolve().parents[1]
     migration = Config(str(root / 'alembic.ini'))
     migration.set_main_option('script_location', str(root / 'alembic'))
@@ -51,15 +62,56 @@ async def lifespan(app: FastAPI):
     with engine.begin() as connection:
         migration.attributes['connection'] = connection
         command.upgrade(migration, 'head')
+
+
+def mark_interrupted(experimental: bool):
     with SessionLocal() as db:
+        queued_requirements = set(db.scalars(select(QueuedJob.target_id).where(QueuedJob.kind == 'requirements', QueuedJob.status == 'queued'))) if experimental else set()
+        queued_proposals = set(db.scalars(select(QueuedJob.target_id).where(QueuedJob.kind == 'proposal', QueuedJob.status == 'queued'))) if experimental else set()
+        queued_edits = set(db.scalars(select(QueuedJob.target_id).where(QueuedJob.kind == 'section_edit', QueuedJob.status == 'queued'))) if experimental else set()
+        queued_checks = set(db.scalars(select(QueuedJob.target_id).where(QueuedJob.kind == 'consistency', QueuedJob.status == 'queued'))) if experimental else set()
         for task in db.scalars(select(AnalysisTask).where(AnalysisTask.status.in_(["pending", "running"]))):
+            if task.status == 'pending' and task.id in queued_requirements:
+                continue
             task.status = "interrupted"
             task.error = "服务中断，请重新发起整理。"
         for draft in db.scalars(select(ProposalDraft).where(ProposalDraft.status.in_(["pending", "running"]))):
+            if draft.status == 'pending' and draft.id in queued_proposals:
+                continue
             draft.status = "interrupted"
             draft.error = "服务中断，请重新生成初稿。"
+        for edit in db.scalars(select(SectionEdit).where(SectionEdit.status.in_(['pending', 'running']))):
+            if edit.status == 'pending' and edit.id in queued_edits:
+                continue
+            edit.status = 'interrupted'
+            edit.error = '服务中断，请重新发起修改。'
+        for check in db.scalars(select(ConsistencyCheck).where(ConsistencyCheck.status.in_(['pending', 'running']))):
+            if check.status == 'pending' and check.id in queued_checks:
+                continue
+            check.status = 'interrupted'
+            check.error = '服务中断，请重新发起检查。'
         db.commit()
-    yield
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    experimental = os.environ.get('QISHU_EXPERIMENTAL_MULTIUSER') == '1'
+    if experimental and (engine.dialect.name != 'sqlite' or not engine.url.database or
+                         Path(engine.url.database).resolve() != (DATA_DIR / 'qishu.sqlite3').resolve()):
+        raise RuntimeError('多人本机测试必须使用数据目录内的 SQLite 数据库。')
+    from .queue_worker import LocalQueueWorker
+    worker = LocalQueueWorker(data_dir=DATA_DIR, db_engine=engine, session_factory=SessionLocal)
+    worker.acquire(shared=not experimental)
+    try:
+        migrate_database()
+        if experimental:
+            worker.recover()
+        mark_interrupted(experimental)
+        if experimental:
+            worker.start()
+        yield
+    finally:
+        worker.close()
 
 app = FastAPI(title='qi-shu 本地工作台', lifespan=lifespan)
 
@@ -98,37 +150,96 @@ class ProjectOutput(BaseModel):
     id: str
     name: str
     background: str
+    role: str = 'owner'
+    state: str = 'active'
+    state_version: int = 0
+
+class MaterialCoverage(BaseModel):
+    locations: list[str] = []
+    locations_truncated: bool = False
+    warning: str = ''
+
+def material_coverage(text: str, warning: str) -> MaterialCoverage:
+    locations = list(dict.fromkeys(re.findall(r'\[第\d+(?:页(?: 表格\d+)?|段|表)\]', text)))
+    return MaterialCoverage(locations=locations[:1000], locations_truncated=len(locations)>1000, warning=warning)
 
 class MaterialOutput(BaseModel):
     id: str
     filename: str
+    display_name: str = ''
     characters: int
     text: str
     warning: str = ""
     preview_truncated: bool = False
+    group_id: str = ''
+    version: int = 1
+    state: str = 'active'
+    state_version: int = 0
+    coverage: MaterialCoverage = Field(default_factory=MaterialCoverage)
+
+def material_display_name(db: Session, material: Material, version: MaterialVersion | None = None) -> str:
+    version = version or db.get(MaterialVersion, material.id)
+    label = db.get(MaterialLabel, version.group_id if version else material.id)
+    if not label:
+        return material.filename
+    return f'{material.filename}（资料 {label.number}）· 第 {version.version if version else 1} 版'
 
 def project_or_404(db: Session, project_id: str):
     project = db.scalar(select(Project).where(Project.id == project_id, Project.owner_id == 'local-user'))
-    if not project:
+    if not project or (multiuser.get() and not can_access(db, project_id, actor_id.get(), 'read')):
         raise ApiError('NOT_FOUND', '找不到这个项目。', 404)
     return project
+
+def require_project_owner(db: Session, project_id: str):
+    if multiuser.get() and member_role(db, project_id, actor_id.get()) != 'owner':
+        raise ApiError('FORBIDDEN', '此操作需要项目负责人执行。', 403)
 
 @app.post('/api/v1/projects', response_model=ProjectOutput, status_code=201)
 def create_project(body: ProjectInput, db: Session = Depends(db_session)):
     if not body.name.strip():
         raise ApiError('INVALID_INPUT', '请填写项目名称。', 422)
     project = Project(name=body.name.strip(), background=body.background)
-    db.add(project)
+    if multiuser.get():
+        initialize_project_owner(db, project, actor_id.get())
+    else:
+        db.add(project)
     db.commit()
     return ProjectOutput(id=project.id, name=project.name, background=project.background)
 
 @app.get('/api/v1/projects', response_model=list[ProjectOutput])
 def list_projects(db: Session = Depends(db_session)):
     projects = db.scalars(select(Project).where(Project.owner_id == 'local-user').order_by(Project.created_at.desc()))
-    return [ProjectOutput(id=p.id, name=p.name, background=p.background) for p in projects]
+    result = []
+    for project in projects:
+        role = member_role(db, project.id, actor_id.get()) if multiuser.get() else 'owner'
+        if role:
+            state, version = current_state(db, project.id) if multiuser.get() else ('active', 0)
+            result.append(ProjectOutput(id=project.id, name=project.name, background=project.background,
+                                        role=role, state=state, state_version=version))
+    return result
+
+@app.post('/api/v1/navigation/interpret', response_model=NavigationInterpretOutput)
+async def interpret_navigation_request(body: NavigationInterpretInput, db: Session = Depends(db_session)):
+    if not body.text.strip():
+        raise ApiError('INVALID_INPUT', '请输入要前往的内容。', 422)
+    if not body.confirm_external_use:
+        raise ApiError('CONFIRMATION_REQUIRED', '请先确认发送输入文字和可能产生的费用。', 400)
+    key = model_key()
+    allowed, _ = model_settings(db)
+    if not key or not allowed:
+        raise ApiError('MODEL_NOT_CONFIGURED', '模型暂不可用，请使用本地导航。', 400)
+    try:
+        return await run_in_threadpool(interpret_navigation, body.text.strip(), key, allowed[0])
+    except NavigationModelError as exc:
+        raise ApiError('NAVIGATION_UNAVAILABLE', str(exc), 503) from None
+    except Exception:
+        raise ApiError('NAVIGATION_UNAVAILABLE', '导航识别暂时不可用，请使用本地导航。', 503) from None
 
 @app.post('/api/v1/projects/{project_id}/materials', response_model=MaterialOutput, status_code=201)
-async def upload_material(project_id: str, file: UploadFile = File(...), db: Session = Depends(db_session)):
+async def upload_material(project_id: str, file: UploadFile = File(...), allow_duplicate: bool = False, db: Session = Depends(db_session)):
+    return await save_material(project_id, file, db, allow_duplicate)
+
+async def save_material(project_id: str, file: UploadFile, db: Session, allow_duplicate: bool, original_id: str | None = None):
     project_or_404(db, project_id)
     name = (file.filename or '').replace('\\', '/').rsplit('/', 1)[-1]
     if not name or len(name) > 255 or any(ord(c) < 32 for c in name):
@@ -143,7 +254,26 @@ async def upload_material(project_id: str, file: UploadFile = File(...), db: Ses
         material_text, note = await run_in_threadpool(parse_content, name, content)
     except ParseError as exc:
         raise ApiError('INVALID_FILE', str(exc), 422) from None
+    digest = hashlib.sha256(content).hexdigest()
+    # Serialize duplicate checks and group version allocation within this project.
+    db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+    duplicate = db.scalar(select(Material).join(MaterialOriginal, MaterialOriginal.material_id == Material.id).where(Material.project_id == project_id, MaterialOriginal.sha256 == digest))
+    if duplicate and not allow_duplicate:
+        db.rollback()
+        raise ApiError('DUPLICATE_MATERIAL', '本项目已有内容相同的资料。可选择继续添加，或使用已有资料。', 409)
+    group_id, version = None, 1
+    if original_id:
+        previous = db.scalar(select(MaterialVersion).where(MaterialVersion.material_id == original_id, MaterialVersion.project_id == project_id))
+        if not previous:
+            db.rollback()
+            raise ApiError('NOT_FOUND', '找不到该资料。', 404)
+        if previous.state != 'active':
+            db.rollback()
+            raise ApiError('MATERIAL_WITHDRAWN', '已撤回资料请先恢复。', 409)
+        group_id = previous.group_id
+        version = (db.scalar(select(func.max(MaterialVersion.version)).where(MaterialVersion.project_id == project_id, MaterialVersion.group_id == group_id)) or 0) + 1
     material_id = new_id()
+    group_id = group_id or material_id
     originals = DATA_DIR / 'materials'
     originals.mkdir(mode=0o700, parents=True, exist_ok=True)
     stored = originals / material_id
@@ -151,21 +281,133 @@ async def upload_material(project_id: str, file: UploadFile = File(...), db: Ses
         with stored.open('xb') as handle:
             handle.write(content)
         stored.chmod(0o600)
-        material = Material(id=material_id, project_id=project_id, filename=name, text=material_text, warning=note)
+        material = Material(id=material_id, project_id=project_id, filename=name, text=material_text, warning=note, created_by=actor_id.get() if multiuser.get() else None)
         db.add(material)
-        db.add(MaterialOriginal(material_id=material_id, filename_on_disk=material_id, byte_size=len(content), sha256=hashlib.sha256(content).hexdigest()))
+        db.add(MaterialOriginal(material_id=material_id, filename_on_disk=material_id, byte_size=len(content), sha256=digest))
+        db.add(MaterialVersion(material_id=material_id, project_id=project_id, group_id=group_id, version=version, state='active', state_version=0))
+        if not db.get(MaterialLabel, group_id):
+            number = (db.scalar(select(func.max(MaterialLabel.number)).where(MaterialLabel.project_id == project_id)) or 0) + 1
+            db.add(MaterialLabel(group_id=group_id, project_id=project_id, number=number))
         db.commit()
     except Exception:
         db.rollback()
         stored.unlink(missing_ok=True)
         raise ApiError('SAVE_FAILED', '资料保存失败，请重试。', 500) from None
-    return MaterialOutput(id=material.id, filename=material.filename, characters=len(material.text), text=material.text[:10000], warning=note, preview_truncated=len(material.text) > 10000)
+    return MaterialOutput(id=material.id, filename=material.filename, display_name=material_display_name(db, material), characters=len(material.text), text=material.text[:10000], warning=note, preview_truncated=len(material.text) > 10000, group_id=group_id, version=version, coverage=material_coverage(material.text, note))
 
 @app.get('/api/v1/projects/{project_id}/materials', response_model=list[MaterialOutput])
 def list_materials(project_id: str, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
     materials = db.scalars(select(Material).where(Material.project_id == project_id, Material.owner_id == 'local-user').order_by(Material.created_at))
-    return [MaterialOutput(id=m.id, filename=m.filename, characters=len(m.text), text=m.text[:10000], warning=m.warning, preview_truncated=len(m.text) > 10000) for m in materials]
+    return [MaterialOutput(id=m.id, filename=m.filename, display_name=material_display_name(db,m,v), characters=len(m.text), text=m.text[:10000], warning=m.warning, preview_truncated=len(m.text) > 10000, group_id=v.group_id if v else m.id, version=v.version if v else 1, state=v.state if v else 'active', state_version=v.state_version if v else 0, coverage=material_coverage(m.text,m.warning)) for m in materials for v in [db.get(MaterialVersion, m.id)]]
+
+@app.post('/api/v1/projects/{project_id}/materials/{material_id}/versions', response_model=MaterialOutput, status_code=201)
+async def upload_material_version(project_id: str, material_id: str, file: UploadFile = File(...), allow_duplicate: bool = False, db: Session = Depends(db_session)):
+    return await save_material(project_id, file, db, allow_duplicate, material_id)
+
+@app.get('/api/v1/projects/{project_id}/materials/{material_id}/versions', response_model=list[MaterialOutput])
+def list_material_versions(project_id: str, material_id: str, db: Session = Depends(db_session)):
+    project_or_404(db, project_id)
+    ref = db.scalar(select(MaterialVersion).where(MaterialVersion.project_id == project_id, MaterialVersion.material_id == material_id))
+    if not ref:
+        raise ApiError('NOT_FOUND', '找不到该资料。', 404)
+    rows = db.execute(select(Material, MaterialVersion).join(MaterialVersion, MaterialVersion.material_id == Material.id).where(MaterialVersion.project_id == project_id, MaterialVersion.group_id == ref.group_id).order_by(MaterialVersion.version.desc()))
+    return [MaterialOutput(id=m.id, filename=m.filename, display_name=material_display_name(db,m,v), characters=len(m.text), text=m.text[:10000], warning=m.warning, preview_truncated=len(m.text)>10000, group_id=v.group_id, version=v.version, state=v.state, state_version=v.state_version, coverage=material_coverage(m.text,m.warning)) for m, v in rows]
+
+class MaterialStateInput(BaseModel):
+    state_version: int = Field(ge=0)
+    confirm: bool = False
+    reason: str = Field(default='', max_length=1000)
+
+class MaterialStateOutput(BaseModel):
+    state: Literal['active', 'withdrawn']
+    state_version: int
+
+class MaterialImpactOutput(BaseModel):
+    requirements: int
+    baselines: int
+    proposals: int
+    active_tasks: int
+    affected_requirements: list[str] = []
+
+def material_impact(db: Session, project_id: str, material_id: str):
+    requirement_ids = list(db.scalars(select(Requirement.id).where(Requirement.project_id == project_id, Requirement.material_id == material_id))) + list(db.scalars(select(ManualRequirement.id).where(ManualRequirement.project_id == project_id, ManualRequirement.material_id == material_id)))
+    baseline_ids = []
+    for baseline in db.scalars(select(Baseline).where(Baseline.project_id == project_id)):
+        related = db.get(BaselineQuestions, baseline.id)
+        facts = db.get(BaselineFacts, baseline.id)
+        try:
+            entries = json.loads(baseline.snapshot) + (json.loads(related.snapshot) if related else []) + (json.loads(facts.snapshot) if facts else [])
+            if any(source.get('material_id') == material_id for entry in entries for source in [entry] + (entry.get('related_sources') or [])):
+                baseline_ids.append(baseline.id)
+        except (ValueError, TypeError, AttributeError):
+            raise ApiError('SOURCE_CHECK_FAILED', '无法核对资料引用，请稍后重试。', 409) from None
+    input_draft_ids = set(db.scalars(select(ProposalInputSource.draft_id).where(ProposalInputSource.project_id==project_id, ProposalInputSource.material_id==material_id)))
+    baseline_draft_ids = set(db.scalars(select(ProposalDraft.id).where(ProposalDraft.project_id==project_id, ProposalDraft.baseline_id.in_(baseline_ids))))
+    affected = list(db.scalars(select(Requirement.text).where(Requirement.project_id == project_id, Requirement.id.in_(requirement_ids)))) + list(db.scalars(select(ManualRequirement.text).where(ManualRequirement.project_id == project_id, ManualRequirement.id.in_(requirement_ids))))
+    return MaterialImpactOutput(requirements=len(requirement_ids), baselines=len(baseline_ids), affected_requirements=affected[:10],
+        proposals=len(input_draft_ids | baseline_draft_ids),
+        active_tasks=(db.scalar(select(func.count()).select_from(QueuedJob).where(QueuedJob.project_id == project_id, QueuedJob.status.in_(['queued','running']))) or 0) + (db.scalar(select(func.count()).select_from(AnalysisTask).where(AnalysisTask.project_id == project_id, AnalysisTask.status.in_(['pending','running']))) or 0) + (db.scalar(select(func.count()).select_from(ProposalDraft).where(ProposalDraft.project_id == project_id, ProposalDraft.status.in_(['pending','running']))) or 0) + (db.scalar(select(func.count()).select_from(SectionEdit).where(SectionEdit.project_id == project_id, SectionEdit.status.in_(['pending','running']))) or 0) + (db.scalar(select(func.count()).select_from(ConsistencyCheck).where(ConsistencyCheck.project_id == project_id, ConsistencyCheck.status.in_(['pending','running']))) or 0))
+
+def require_active_materials(db: Session, project_id: str, material_ids):
+    ids = {value for value in material_ids if value}
+    if not ids:
+        return
+    versions = list(db.scalars(select(MaterialVersion).where(MaterialVersion.project_id == project_id, MaterialVersion.material_id.in_(ids))))
+    if any(v.state != 'active' for v in versions):
+        raise ApiError('MATERIAL_WITHDRAWN', '所选资料已撤回或不可用，请先核对。', 409)
+
+def require_draft_materials_active(db: Session, draft):
+    baseline = db.scalar(select(Baseline).where(Baseline.id == draft.baseline_id, Baseline.project_id == draft.project_id))
+    if not baseline:
+        raise ApiError('NOT_FOUND', '找不到方案的需求清单。', 404)
+    questions = db.get(BaselineQuestions, baseline.id)
+    facts = db.get(BaselineFacts, baseline.id)
+    try:
+        entries = json.loads(baseline.snapshot) + (json.loads(questions.snapshot) if questions else []) + (json.loads(facts.snapshot) if facts else [])
+        ids = [source.get('material_id') for entry in entries for source in [entry] + (entry.get('related_sources') or [])]
+    except (ValueError, TypeError, AttributeError):
+        raise ApiError('SOURCE_CHECK_FAILED', '无法核对方案资料来源。', 409) from None
+    db.execute(update(Project).where(Project.id == draft.project_id).values(name=Project.name))
+    input_sources=list(db.scalars(select(ProposalInputSource).where(ProposalInputSource.project_id==draft.project_id,ProposalInputSource.draft_id==getattr(draft,'id',''))))
+    ids.extend(source.material_id for source in input_sources)
+    require_active_materials(db, draft.project_id, ids)
+    for source in input_sources:
+        material,version,original=project_input_material(db,draft.project_id,source.material_id)
+        if version.version != source.version or version.state_version != source.state_version or original.sha256 != source.file_hash or hashlib.sha256(material.text.encode('utf-8')).hexdigest() != source.text_hash:
+            raise ApiError('SOURCE_CHECK_FAILED','方案所用模板或案例已变化，请重新核对。',409)
+
+@app.get('/api/v1/projects/{project_id}/materials/{material_id}/impact', response_model=MaterialImpactOutput)
+def get_material_impact(project_id: str, material_id: str, db: Session = Depends(db_session)):
+    project_or_404(db, project_id)
+    if not db.scalar(select(MaterialVersion.material_id).where(MaterialVersion.project_id == project_id, MaterialVersion.material_id == material_id)):
+        raise ApiError('NOT_FOUND', '找不到该资料。', 404)
+    return material_impact(db, project_id, material_id)
+
+@app.post('/api/v1/projects/{project_id}/materials/{material_id}/{action}', response_model=MaterialStateOutput)
+def change_material_state(project_id: str, material_id: str, action: Literal['withdraw', 'restore'], body: MaterialStateInput, db: Session = Depends(db_session)):
+    project_or_404(db, project_id)
+    require_project_owner(db, project_id)
+    if not body.confirm:
+        raise ApiError('CONFIRMATION_REQUIRED', '请确认资料状态变更。', 400)
+    db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+    row = db.scalar(select(MaterialVersion).where(MaterialVersion.project_id == project_id, MaterialVersion.material_id == material_id))
+    if not row:
+        raise ApiError('NOT_FOUND', '找不到该资料。', 404)
+    if row.state_version != body.state_version:
+        raise ApiError('VERSION_CONFLICT', '资料状态已变化，请刷新后重试。', 409)
+    target = 'withdrawn' if action == 'withdraw' else 'active'
+    if row.state == target:
+        raise ApiError('INVALID_STATE', '资料当前已处于该状态。', 409)
+    if action == 'withdraw' and material_impact(db, project_id, material_id).active_tasks:
+        raise ApiError('ACTIVE_TASKS', '项目仍有未结束任务，请等待完成或取消后再撤回资料。', 409)
+    changed = db.execute(update(MaterialVersion).where(MaterialVersion.material_id == material_id, MaterialVersion.state_version == body.state_version).values(state=target, state_version=body.state_version + 1))
+    if changed.rowcount != 1:
+        db.rollback()
+        raise ApiError('VERSION_CONFLICT', '资料状态已变化，请刷新后重试。', 409)
+    db.add(MaterialStateEvent(material_id=material_id, project_id=project_id, actor=actor_id.get(), action=action, reason=body.reason.strip()))
+    db.commit()
+    return {'state': target, 'state_version': body.state_version + 1}
 
 class TaskInput(BaseModel):
     material_ids: list[str] = Field(min_length=1)
@@ -174,6 +416,7 @@ class TaskInput(BaseModel):
 
 class ExternalApproval(BaseModel):
     confirm_external_use: bool = False
+    model_name: str | None = Field(default=None, min_length=1, max_length=100)
 
 class TaskOutput(BaseModel):
     id: str
@@ -188,6 +431,9 @@ class TaskOutput(BaseModel):
     estimated_cost_usd: float | None = None
     model_name: str = ""
     elapsed_ms: int | None = None
+    requirement_count: int = 0
+    fact_count: int = 0
+    question_count: int = 0
 
 def task_output(db: Session, task: AnalysisTask):
     segments = list(db.scalars(select(TaskSegment).where(TaskSegment.task_id == task.id)))
@@ -201,9 +447,14 @@ def task_output(db: Session, task: AnalysisTask):
     timings = list(db.scalars(select(TaskAttemptTiming).where(TaskAttemptTiming.attempt_id.in_([a.id for a in attempts])))) if attempts else []
     elapsed = sum(t.elapsed_ms for t in timings) if timings else None
     pricing = db.get(TaskPricing, task.id)
-    if complete and pricing:
+    model_changed = bool(db.scalar(select(TaskModelChange.id).where(TaskModelChange.task_id == task.id).limit(1)))
+    all_flash = all(a.model_name == 'deepseek-flash' or (a.model_name is None and not model_changed and config and config.model_name == 'deepseek-flash') for a in attempts)
+    if complete and pricing and all_flash:
         estimate = float((Decimal(sum(prompt)) * Decimal(pricing.input_per_million) + Decimal(sum(completion)) * Decimal(pricing.output_per_million)) / Decimal(1000000))
-    return TaskOutput(id=task.id, status=task.status, error=task.error, segments_total=len(segments), segments_completed=sum(s.status == 'completed' for s in segments), calls=len(attempts), prompt_tokens=sum(prompt) if prompt else None, completion_tokens=sum(completion) if completion else None, usage_complete=complete, estimated_cost_usd=estimate, model_name=config.model_name if config else '', elapsed_ms=elapsed)
+    return TaskOutput(id=task.id, status=task.status, error=task.error, segments_total=len(segments), segments_completed=sum(s.status == 'completed' for s in segments), calls=len(attempts), prompt_tokens=sum(prompt) if prompt else None, completion_tokens=sum(completion) if completion else None, usage_complete=complete, estimated_cost_usd=estimate, model_name=config.model_name if config else '', elapsed_ms=elapsed,
+        requirement_count=db.scalar(select(func.count()).select_from(Requirement).where(Requirement.task_id == task.id)),
+        fact_count=db.scalar(select(func.count()).select_from(ExtractedFact).where(ExtractedFact.task_id == task.id)),
+        question_count=db.scalar(select(func.count()).select_from(OpenQuestion).where(OpenQuestion.task_id == task.id)))
 
 class ReviewInput(BaseModel):
     status: str
@@ -213,6 +464,19 @@ class ReviewInput(BaseModel):
 class CitationOutput(BaseModel):
     material_id: str
     quote: str
+
+def citation_location(db: Session, project_id: str, material_id: str, quote: str) -> str:
+    if not material_id or not quote:
+        return ''
+    material = db.scalar(select(Material).where(Material.project_id == project_id, Material.id == material_id))
+    if not material:
+        return ''
+    matched = align_quote(quote, material.text)
+    if not matched or material.text.count(matched) != 1:
+        return ''
+    position = material.text.find(matched)
+    markers = list(re.finditer(r'\[第\d+(?:页(?: 表格\d+)?|段|表)\]', material.text[:position]))
+    return markers[-1].group().strip('[]') if markers else ''
 
 def citations(db: Session, project_id: str, kind: str, item_id: str):
     rows = db.scalars(select(AdditionalCitation).where(AdditionalCitation.project_id == project_id, AdditionalCitation.item_type == kind, AdditionalCitation.item_id == item_id))
@@ -227,29 +491,35 @@ class RequirementOutput(BaseModel):
     status: str
     version: int
     related_sources: list[CitationOutput] = []
+    origin: str = 'material'
+    location: str = ''
 
-def req_output(row: Requirement, db: Session):
-    return RequirementOutput(id=row.id, text=row.text, original_text=row.original_text, material_id=row.material_id, quote=row.quote, status=row.status, version=row.version, related_sources=citations(db, row.project_id, "requirement", row.id))
+def req_output(row: Requirement | ManualRequirement, db: Session):
+    if isinstance(row, ManualRequirement):
+        return RequirementOutput(id=row.id, text=row.text, original_text=row.original_text, material_id=row.material_id or '', quote=row.quote or '', status=row.status, version=row.version, related_sources=[], origin='manual', location=citation_location(db,row.project_id,row.material_id or '',row.quote or ''))
+    return RequirementOutput(id=row.id, text=row.text, original_text=row.original_text, material_id=row.material_id, quote=row.quote, status=row.status, version=row.version, related_sources=citations(db, row.project_id, "requirement", row.id), location=citation_location(db, row.project_id, row.material_id, row.quote))
 
 @app.post('/api/v1/projects/{project_id}/requirement-tasks', response_model=TaskOutput, status_code=202)
 def start_task(project_id: str, body: TaskInput, background: BackgroundTasks, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
-    if not os.environ.get('DEEPSEEK_API_KEY', '').strip():
+    if not model_key():
         raise ApiError('MODEL_NOT_CONFIGURED', '请先在本机配置模型密钥。', 400)
     if not body.confirm_external_use:
         raise ApiError('CONFIRMATION_REQUIRED', '请先确认资料发送和模型费用。', 400)
-    allowed_models = [x.strip() for x in os.environ.get('DEEPSEEK_ALLOWED_MODELS', 'deepseek-flash').split(',') if x.strip()]
+    allowed_models, _ = model_settings(db)
     if body.model_name not in allowed_models:
         raise ApiError('MODEL_NOT_ALLOWED', '此模型未在允许列表中。', 422)
     ids = list(dict.fromkeys(body.material_ids))
     materials = list(db.scalars(select(Material).where(Material.project_id == project_id, Material.id.in_(ids))))
     if len(materials) != len(ids):
         raise ApiError('INVALID_MATERIAL', '所选资料不存在。', 422)
-    task = AnalysisTask(project_id=project_id, material_ids=json.dumps(ids))
+    db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+    require_active_materials(db, project_id, ids)
+    task = AnalysisTask(project_id=project_id, material_ids=json.dumps(ids), created_by=actor_id.get() if multiuser.get() else None)
     db.add(task)
     db.flush()
     db.add(TaskConfig(task_id=task.id, model_name=body.model_name))
-    db.add(ModelConsent(task_id=task.id, action='start'))
+    db.add(ModelConsent(task_id=task.id, action='start', actor=actor_id.get()))
     if body.model_name == 'deepseek-flash':
         db.add(TaskPricing(task_id=task.id, input_per_million='0.30', output_per_million='1.20', pricing_date='2026-10-27', pricing_reference='https://api-docs.deepseek.com/quick_start/pricing/'))
     position = 0
@@ -257,8 +527,11 @@ def start_task(project_id: str, body: TaskInput, background: BackgroundTasks, db
         for start, end in split_offsets(material.text):
             db.add(TaskSegment(task_id=task.id, material_id=material.id, position=position, start=start, end=end))
             position += 1
+    if multiuser.get():
+        enqueue(db, project_id, actor_id.get(), 'requirements', task.id)
     db.commit()
-    background.add_task(execute_task, task.id)
+    if not multiuser.get():
+        background.add_task(execute_task, task.id)
     return task_output(db, task)
 
 @app.get('/api/v1/projects/{project_id}/requirement-tasks/{task_id}', response_model=TaskOutput)
@@ -272,29 +545,136 @@ def get_task(project_id: str, task_id: str, db: Session = Depends(db_session)):
 @app.get('/api/v1/projects/{project_id}/requirements', response_model=list[RequirementOutput])
 def list_requirements(project_id: str, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
-    return [req_output(r, db) for r in db.scalars(select(Requirement).where(Requirement.project_id == project_id))]
+    rows = list(db.scalars(select(Requirement).where(Requirement.project_id == project_id))) + list(db.scalars(select(ManualRequirement).where(ManualRequirement.project_id == project_id)))
+    return [req_output(r, db) for r in rows]
 
-@app.patch('/api/v1/projects/{project_id}/requirements/{requirement_id}', response_model=RequirementOutput)
-def review_requirement(project_id: str, requirement_id: str, body: ReviewInput, db: Session = Depends(db_session)):
-    project_or_404(db, project_id)
+class ManualRequirementInput(BaseModel):
+    text: str = Field(min_length=1, max_length=3000)
+    material_id: str | None = Field(default=None,max_length=36)
+    quote: str = Field(default='',max_length=3000)
+
+class RequirementRevisionInput(BaseModel):
+    text: str = Field(min_length=1, max_length=3000)
+    version: int = Field(ge=1)
+
+class RequirementRevisionDecisionInput(BaseModel):
+    decision: Literal['accept', 'reject']
+
+class RequirementRevisionOutput(BaseModel):
+    id: str
+    requirement_id: str
+    base_version: int
+    original_text: str
+    proposed_text: str
+    status: Literal['pending', 'accepted', 'rejected']
+    created_by: str
+    created_at: str
+    decided_by: str | None
+    decided_at: str | None
+
+def requirement_or_404(db: Session, project_id: str, requirement_id: str):
     row = db.scalar(select(Requirement).where(Requirement.id == requirement_id, Requirement.project_id == project_id))
-    if not row:
+    if row is None:
+        row = db.scalar(select(ManualRequirement).where(ManualRequirement.id == requirement_id, ManualRequirement.project_id == project_id))
+    if row is None:
         raise ApiError('NOT_FOUND', '找不到这条需求。', 404)
+    return row
+
+def save_requirement_change(db, row, body):
     if body.version != row.version:
         raise ApiError('VERSION_CONFLICT', '内容已更新，请刷新后重试。', 409)
     if body.status not in ('pending', 'confirmed', 'rejected') or not body.text.strip():
         raise ApiError('INVALID_INPUT', '请填写需求并选择有效状态。', 422)
+    if body.status != 'pending' or row.status != 'pending':
+        require_project_owner(db, row.project_id)
+    if body.status == 'confirmed' and row.material_id:
+        db.execute(update(Project).where(Project.id == row.project_id).values(name=Project.name))
+        sources = [row.material_id] + ([item.material_id for item in citations(db, row.project_id, 'requirement', row.id)] if isinstance(row, Requirement) else [])
+        require_active_materials(db, row.project_id, sources)
     if row.status == body.status and row.text == body.text.strip():
         return req_output(row, db)
+    model = ManualRequirement if isinstance(row, ManualRequirement) else Requirement
+    event = ManualRequirementEvent if isinstance(row, ManualRequirement) else RequirementDecision
     before_text, before_status = row.text, row.status
-    changed = db.execute(update(Requirement).where(Requirement.id == requirement_id, Requirement.project_id == project_id, Requirement.version == body.version).values(text=body.text.strip(), status=body.status, version=body.version + 1))
+    changed = db.execute(update(model).where(model.id == row.id, model.project_id == row.project_id, model.version == body.version).values(text=body.text.strip(), status=body.status, version=body.version + 1))
     if changed.rowcount != 1:
         db.rollback()
         raise ApiError('VERSION_CONFLICT', '内容已更新，请刷新后重试。', 409)
-    db.add(RequirementDecision(requirement_id=row.id, from_version=body.version, old_text=before_text, new_text=body.text.strip(), old_status=before_status, new_status=body.status))
-    db.commit()
-    db.refresh(row)
+    db.add(event(requirement_id=row.id, from_version=body.version, old_text=before_text, new_text=body.text.strip(), old_status=before_status, new_status=body.status, actor=actor_id.get()))
+    db.commit(); db.refresh(row)
     return req_output(row, db)
+
+@app.post('/api/v1/projects/{project_id}/requirements/manual', response_model=RequirementOutput, status_code=201)
+def create_manual_requirement(project_id: str, body: ManualRequirementInput, db: Session=Depends(db_session)):
+    project_or_404(db, project_id)
+    if not body.text.strip():
+        raise ApiError('INVALID_INPUT', '请填写需求内容。', 422)
+    if bool(body.material_id) != bool(body.quote.strip()):
+        raise ApiError('INVALID_INPUT', '选择资料和填写原文需同时完成。', 422)
+    material_id, quote = None, None
+    if body.material_id:
+        db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+        material = db.scalar(select(Material).where(Material.id == body.material_id, Material.project_id == project_id))
+        if not material:
+            raise ApiError('NOT_FOUND', '找不到该资料。', 404)
+        require_active_materials(db, project_id, [material.id])
+        quote = align_quote(body.quote, material.text)
+        if not quote:
+            raise ApiError('INVALID_QUOTE', '所填写的原文未在该资料中找到。', 422)
+        material_id = material.id
+    row=ManualRequirement(project_id=project_id, text=body.text.strip(), original_text=body.text.strip(), material_id=material_id, quote=quote, created_by=actor_id.get(), status='pending', version=1)
+    db.add(row); db.commit(); db.refresh(row)
+    return req_output(row, db)
+
+def revision_output(row):
+    return {'id':row.id,'requirement_id':row.requirement_id,'base_version':row.base_version,'original_text':row.original_text,'proposed_text':row.proposed_text,'status':row.status,'created_by':row.created_by,'created_at':row.created_at.isoformat(),'decided_by':row.decided_by,'decided_at':row.decided_at.isoformat() if row.decided_at else None}
+
+@app.get('/api/v1/projects/{project_id}/requirements/{requirement_id}/revisions', response_model=list[RequirementRevisionOutput])
+def list_requirement_suggestions(project_id: str, requirement_id: str, db:Session=Depends(db_session)):
+    project_or_404(db,project_id); requirement_or_404(db,project_id,requirement_id)
+    return [revision_output(row) for row in db.scalars(select(RequirementRevisionSuggestion).where(RequirementRevisionSuggestion.project_id == project_id, RequirementRevisionSuggestion.requirement_id == requirement_id).order_by(RequirementRevisionSuggestion.created_at.desc()))]
+
+@app.post('/api/v1/projects/{project_id}/requirements/{requirement_id}/revisions', status_code=201, response_model=RequirementRevisionOutput)
+def propose_requirement_revision(project_id: str, requirement_id: str, body:RequirementRevisionInput, db:Session=Depends(db_session)):
+    project_or_404(db,project_id); row=requirement_or_404(db,project_id,requirement_id)
+    if row.status != 'confirmed' or row.version != body.version:
+        raise ApiError('VERSION_CONFLICT', '需求状态或版本已改变，请刷新后重试。', 409)
+    if not body.text.strip() or body.text.strip() == row.text:
+        raise ApiError('INVALID_INPUT', '请填写不同于当前内容的修订建议。', 422)
+    revision=RequirementRevisionSuggestion(project_id=project_id, requirement_id=row.id, base_version=row.version, original_text=row.text, proposed_text=body.text.strip(), status='pending', created_by=actor_id.get())
+    db.add(revision); db.commit(); db.refresh(revision)
+    return revision_output(revision)
+
+@app.post('/api/v1/projects/{project_id}/requirement-revisions/{revision_id}/decision', response_model=RequirementRevisionOutput)
+def decide_requirement_revision(project_id:str, revision_id:str, body:RequirementRevisionDecisionInput, db:Session=Depends(db_session)):
+    project_or_404(db,project_id); require_project_owner(db,project_id)
+    revision=db.scalar(select(RequirementRevisionSuggestion).where(RequirementRevisionSuggestion.id==revision_id, RequirementRevisionSuggestion.project_id==project_id))
+    if not revision: raise ApiError('NOT_FOUND','找不到修订建议。',404)
+    if revision.status!='pending': raise ApiError('VERSION_CONFLICT','修订建议已处理。',409)
+    row=requirement_or_404(db,project_id,revision.requirement_id)
+    if body.decision=='accept':
+        if row.material_id:
+            db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+            sources = [row.material_id] + ([item.material_id for item in citations(db, project_id, 'requirement', row.id)] if isinstance(row, Requirement) else [])
+            require_active_materials(db, project_id, sources)
+        if row.version != revision.base_version or row.status != 'confirmed' or row.text != revision.original_text:
+            raise ApiError('VERSION_CONFLICT','需求已变化，建议仍保留，请刷新后重新提交。',409)
+        model=ManualRequirement if isinstance(row,ManualRequirement) else Requirement
+        event=ManualRequirementEvent if isinstance(row,ManualRequirement) else RequirementDecision
+        changed=db.execute(update(model).where(model.id==row.id,model.version==revision.base_version,model.status=='confirmed').values(text=revision.proposed_text,version=revision.base_version+1))
+        if changed.rowcount!=1:
+            db.rollback(); raise ApiError('VERSION_CONFLICT','需求已变化，建议仍保留。',409)
+        db.add(event(requirement_id=row.id,from_version=revision.base_version,old_text=revision.original_text,new_text=revision.proposed_text,old_status='confirmed',new_status='confirmed',actor=actor_id.get()))
+    changed=db.execute(update(RequirementRevisionSuggestion).where(RequirementRevisionSuggestion.id==revision.id,RequirementRevisionSuggestion.status=='pending').values(status='accepted' if body.decision=='accept' else 'rejected',decided_by=actor_id.get(),decided_at=now()))
+    if changed.rowcount!=1:
+        db.rollback(); raise ApiError('VERSION_CONFLICT','修订建议已处理。',409)
+    db.commit(); db.refresh(revision)
+    return revision_output(revision)
+
+@app.patch('/api/v1/projects/{project_id}/requirements/{requirement_id}', response_model=RequirementOutput)
+def review_requirement(project_id: str, requirement_id: str, body: ReviewInput, db: Session = Depends(db_session)):
+    project_or_404(db, project_id)
+    return save_requirement_change(db, requirement_or_404(db, project_id, requirement_id), body)
 
 class BaselineCreated(BaseModel):
     id: str
@@ -303,10 +683,11 @@ class BaselineCreated(BaseModel):
 @app.post('/api/v1/projects/{project_id}/baselines', response_model=BaselineCreated, status_code=201)
 def create_baseline(project_id: str, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
-    rows = list(db.scalars(select(Requirement).where(Requirement.project_id == project_id, Requirement.status == 'confirmed')))
+    require_project_owner(db, project_id)
+    rows = list(db.scalars(select(Requirement).where(Requirement.project_id == project_id, Requirement.status == 'confirmed'))) + list(db.scalars(select(ManualRequirement).where(ManualRequirement.project_id == project_id, ManualRequirement.status == 'confirmed')))
     if not rows:
         raise ApiError('NO_CONFIRMED_REQUIREMENTS', '请先确认至少一条需求。', 422)
-    baseline = Baseline(project_id=project_id, snapshot=json.dumps([req_output(r, db).model_dump() for r in rows], ensure_ascii=False))
+    baseline = Baseline(project_id=project_id, snapshot=json.dumps([req_output(r, db).model_dump() for r in rows], ensure_ascii=False), created_by=actor_id.get() if multiuser.get() else None)
     db.add(baseline)
     db.flush()
     questions = list(db.scalars(select(OpenQuestion).where(OpenQuestion.project_id == project_id, OpenQuestion.status != 'resolved')))
@@ -370,6 +751,18 @@ def download_original(project_id: str, material_id: str, db: Session = Depends(d
         raise ApiError('ORIGINAL_UNAVAILABLE', '原文件不可用。', 404)
     return FileResponse(path, filename=material.filename, media_type='application/octet-stream')
 
+@app.get('/api/v1/projects/{project_id}/materials/{material_id}/pdf-preview')
+def preview_pdf(project_id: str, material_id: str, db: Session = Depends(db_session)):
+    project_or_404(db, project_id)
+    material = db.scalar(select(Material).where(Material.id == material_id, Material.project_id == project_id, Material.owner_id == 'local-user'))
+    if not material or not material.filename.lower().endswith('.pdf'):
+        raise ApiError('NOT_FOUND', '找不到这份 PDF 资料。', 404)
+    record = db.get(MaterialOriginal, material.id)
+    path = DATA_DIR / 'materials' / material.id
+    if not record or record.filename_on_disk != material.id or not path.is_file():
+        raise ApiError('ORIGINAL_UNAVAILABLE', '原文件不可用。', 404)
+    return FileResponse(path, media_type='application/pdf', headers={'Content-Disposition': 'inline', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, no-store'})
+
 @app.get('/api/v1/projects/{project_id}/requirement-tasks', response_model=list[TaskOutput])
 def list_tasks(project_id: str, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
@@ -382,23 +775,38 @@ def resume_task(project_id: str, task_id: str, body: ExternalApproval, backgroun
     task = db.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.project_id == project_id, AnalysisTask.owner_id == 'local-user'))
     if not task:
         raise ApiError('NOT_FOUND', '找不到整理任务。', 404)
-    if not os.environ.get('DEEPSEEK_API_KEY', '').strip():
+    if not model_key():
         raise ApiError('MODEL_NOT_CONFIGURED', '请先在本机配置模型密钥。', 400)
     if not body.confirm_external_use:
         raise ApiError('CONFIRMATION_REQUIRED', '请先确认继续发送资料和模型费用。', 400)
-    if task.status not in ('failed', 'interrupted', 'paused_limit'):
+    config = db.get(TaskConfig, task.id)
+    allowed, maximum = model_settings(db)
+    desired_model = body.model_name or (config.model_name if config else '')
+    if not config or desired_model not in allowed:
+        raise ApiError('MODEL_NOT_ALLOWED', '此模型未在允许列表中。', 422)
+    if task.status not in ('failed', 'interrupted', 'paused_limit', 'cancelled'):
         raise ApiError('INVALID_STATE', '当前任务不能继续。', 409)
+    if multiuser.get() and db.scalar(select(QueuedJob.id).where(QueuedJob.kind == 'requirements', QueuedJob.target_id == task.id, QueuedJob.status == 'running')):
+        raise ApiError('INVALID_STATE', '原请求仍在结束，请稍后再继续。', 409)
     count = db.scalar(select(func.count()).select_from(TaskAttempt).where(TaskAttempt.task_id == task.id))
-    if count >= int(os.environ.get('QISHU_MAX_REQUESTS', '50')):
+    if count >= maximum:
         raise ApiError('CALL_LIMIT', '已达到调用次数上限，需要先调整上限。', 409)
-    changed = db.execute(update(AnalysisTask).where(AnalysisTask.id == task.id, AnalysisTask.status.in_(['failed', 'interrupted', 'paused_limit'])).values(status='pending', error=''))
+    changed = db.execute(update(AnalysisTask).where(AnalysisTask.id == task.id, AnalysisTask.status.in_(['failed', 'interrupted', 'paused_limit', 'cancelled'])).values(status='pending', error=''))
     if changed.rowcount != 1:
         db.rollback()
         raise ApiError('INVALID_STATE', '任务状态已变化，请刷新。', 409)
-    db.add(ModelConsent(task_id=task.id, action='resume'))
+    if desired_model != config.model_name:
+        db.add(TaskModelChange(task_id=task.id, actor_id=actor_id.get(), previous_model=config.model_name, new_model=desired_model))
+        config.model_name = desired_model
+    if desired_model == 'deepseek-flash' and not db.get(TaskPricing, task.id):
+        db.add(TaskPricing(task_id=task.id, input_per_million='0.30', output_per_million='1.20', pricing_date='2026-10-27', pricing_reference='https://api-docs.deepseek.com/quick_start/pricing/'))
+    db.add(ModelConsent(task_id=task.id, action='resume', actor=actor_id.get()))
+    if multiuser.get():
+        enqueue(db, project_id, actor_id.get(), 'requirements', task.id)
     db.commit()
     db.refresh(task)
-    background.add_task(execute_task, task.id)
+    if not multiuser.get():
+        background.add_task(execute_task, task.id)
     return task_output(db, task)
 
 class ConfigOutput(BaseModel):
@@ -408,15 +816,18 @@ class ConfigOutput(BaseModel):
     max_output_tokens: int
 
 @app.get('/api/v1/config', response_model=ConfigOutput)
-def get_config():
-    return ConfigOutput(model_ready=bool(os.environ.get('DEEPSEEK_API_KEY', '').strip()), allowed_models=[x.strip() for x in os.environ.get('DEEPSEEK_ALLOWED_MODELS', 'deepseek-flash').split(',') if x.strip()], max_requests=int(os.environ.get('QISHU_MAX_REQUESTS', '50')), max_output_tokens=int(os.environ.get('QISHU_MAX_OUTPUT_TOKENS', '16384')))
+def get_config(db: Session = Depends(db_session)):
+    allowed, maximum = model_settings(db)
+    return ConfigOutput(model_ready=bool(model_key()), allowed_models=allowed, max_requests=maximum, max_output_tokens=int(os.environ.get('QISHU_MAX_OUTPUT_TOKENS', '16384')))
 
 class QuestionOutput(BaseModel):
+    location: str = ''
     id: str
     text: str
     material_id: str
     quote: str
     status: str
+    version: int
     answer: str = ""
     related_sources: list[CitationOutput] = []
 
@@ -427,7 +838,7 @@ def list_questions(project_id: str, db: Session = Depends(db_session)):
     result = []
     for row in rows:
         latest = db.scalar(select(QuestionDecision).where(QuestionDecision.question_id == row.id).order_by(QuestionDecision.created_at.desc()))
-        result.append(QuestionOutput(id=row.id, text=row.text, material_id=row.material_id, quote=row.quote, status=row.status, answer=latest.answer if latest else '', related_sources=citations(db, project_id, 'question', row.id)))
+        result.append(QuestionOutput(id=row.id, text=row.text, material_id=row.material_id, quote=row.quote, status=row.status, version=row.version, answer=latest.answer if latest else '', related_sources=citations(db, project_id, 'question', row.id), location=citation_location(db, project_id, row.material_id, row.quote)))
     return result
 
 class MaterialPage(BaseModel):
@@ -450,6 +861,7 @@ def material_content(project_id: str, material_id: str, offset: int = 0, limit: 
 class QuestionDecisionInput(BaseModel):
     status: str
     answer: str = Field(default='', max_length=5000)
+    version: int | None = Field(default=None, ge=1)
 
 @app.patch('/api/v1/projects/{project_id}/questions/{question_id}', response_model=QuestionOutput)
 def decide_question(project_id: str, question_id: str, body: QuestionDecisionInput, db: Session = Depends(db_session)):
@@ -459,10 +871,20 @@ def decide_question(project_id: str, question_id: str, body: QuestionDecisionInp
         raise ApiError('NOT_FOUND', '找不到这个问题。', 404)
     if body.status not in ('pending', 'answered', 'resolved') or (body.status != 'pending' and not body.answer.strip()):
         raise ApiError('INVALID_INPUT', '请填写说明并选择有效状态。', 422)
-    row.status = body.status
-    db.add(QuestionDecision(question_id=row.id, action=body.status, answer=body.answer.strip()))
+    if body.status == 'resolved' or row.status == 'resolved':
+        require_project_owner(db, project_id)
+    if multiuser.get() and body.version is None:
+        raise ApiError('VERSION_REQUIRED', '请刷新后重新处理。', 409)
+    expected_version = body.version if body.version is not None else row.version
+    changed = db.execute(update(OpenQuestion).where(OpenQuestion.id == question_id, OpenQuestion.project_id == project_id,
+        OpenQuestion.version == expected_version).values(status=body.status, version=expected_version + 1))
+    if changed.rowcount != 1:
+        db.rollback()
+        raise ApiError('VERSION_CONFLICT', '问题已被其他人修改，请刷新后重试。', 409)
+    db.add(QuestionDecision(question_id=row.id, action=body.status, answer=body.answer.strip(), actor=actor_id.get()))
     db.commit()
-    return QuestionOutput(id=row.id, text=row.text, material_id=row.material_id, quote=row.quote, status=row.status, answer=body.answer.strip(), related_sources=citations(db, project_id, 'question', row.id))
+    db.refresh(row)
+    return QuestionOutput(id=row.id, text=row.text, material_id=row.material_id, quote=row.quote, status=row.status, version=row.version, answer=body.answer.strip(), related_sources=citations(db, project_id, 'question', row.id), location=citation_location(db, project_id, row.material_id, row.quote))
 
 class RequirementHistoryOutput(BaseModel):
     old_text: str
@@ -471,18 +893,25 @@ class RequirementHistoryOutput(BaseModel):
     new_status: str
     from_version: int
     actor: str
+    actor_name: str = '本机操作'
     created_at: str
 
 @app.get('/api/v1/projects/{project_id}/requirements/{requirement_id}/history', response_model=list[RequirementHistoryOutput])
 def requirement_history(project_id: str, requirement_id: str, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
-    row = db.scalar(select(Requirement).where(Requirement.id == requirement_id, Requirement.project_id == project_id))
-    if not row:
-        raise ApiError('NOT_FOUND', '找不到这条需求。', 404)
-    records = db.scalars(select(RequirementDecision).where(RequirementDecision.requirement_id == row.id).order_by(RequirementDecision.created_at))
-    return [RequirementHistoryOutput(old_text=r.old_text, new_text=r.new_text, old_status=r.old_status, new_status=r.new_status, from_version=r.from_version, actor=r.actor, created_at=r.created_at.isoformat()) for r in records]
+    row = requirement_or_404(db, project_id, requirement_id)
+    event = ManualRequirementEvent if isinstance(row, ManualRequirement) else RequirementDecision
+    records = db.scalars(select(event).where(event.requirement_id == row.id).order_by(event.created_at))
+    result = []
+    for r in records:
+        actor = db.get(UserAccount, r.actor)
+        result.append(RequirementHistoryOutput(old_text=r.old_text, new_text=r.new_text, old_status=r.old_status,
+            new_status=r.new_status, from_version=r.from_version, actor=r.actor,
+            actor_name=actor.username if actor else '本机操作', created_at=r.created_at.isoformat()))
+    return result
 
 class FactOutput(BaseModel):
+    location: str = ''
     id: str
     text: str
     material_id: str
@@ -499,6 +928,7 @@ def fact_output(row: ExtractedFact, db: Session):
     review = db.get(FactReview, row.id)
     return FactOutput(id=row.id, text=row.text, material_id=row.material_id, quote=row.quote,
                       related_sources=citations(db, row.project_id, 'fact', row.id),
+                      location=citation_location(db, row.project_id, row.material_id, row.quote),
                       review_status=review.status if review else 'pending',
                       review_version=review.version if review else 0)
 
@@ -529,7 +959,7 @@ def review_fact(project_id: str, fact_id: str, body: FactReviewInput, db: Sessio
             if changed.rowcount != 1:
                 db.rollback()
                 raise ApiError('VERSION_CONFLICT', '核对状态已变化，请刷新后重试。', 409)
-        db.add(FactReviewEvent(fact_id=row.id, old_status=old_status, new_status=body.review_status))
+        db.add(FactReviewEvent(fact_id=row.id, old_status=old_status, new_status=body.review_status, actor=actor_id.get()))
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -543,7 +973,9 @@ EXAMPLE_PATH = Path(__file__).resolve().parents[2] / 'docs/PRD/ToG公司内部�
 
 class ProposalInput(BaseModel):
     baseline_id: str = Field(min_length=1, max_length=36)
-    template_id: Literal['demo-v1']
+    outline_id: str | None = Field(default=None, min_length=1, max_length=36)
+    template_id: str = Field(min_length=1,max_length=50)
+    case_ids: list[str] = Field(default_factory=list, max_length=10)
     model_name: str = Field(default='deepseek-flash', max_length=100)
     include_example: bool = False
     confirm_external_use: bool = False
@@ -574,6 +1006,105 @@ def proposal_output(row: ProposalDraft):
 def proposal_templates():
     return [{'id': 'demo-v1', 'name': '信息化建设方案示例模板（虚构）', 'version': 'V1'}]
 
+class OutlineInput(BaseModel):
+    baseline_id: str = Field(min_length=1,max_length=36)
+    template_id: str = Field(default='demo-v1',min_length=1,max_length=50)
+    chapters: list[OutlineChapter] = Field(min_length=1,max_length=30)
+
+
+def outline_output(row: ProposalOutline, requirements: list[dict]):
+    chapters=json.loads(row.chapters)
+    assigned={rid for chapter in chapters for rid in chapter.get('requirement_ids',[])}
+    return {'id':row.id,'baseline_id':row.baseline_id,'template_id':row.template_id,'version':row.version,
+        'chapters':chapters,'uncovered':[{'id':r['id'],'text':r['text']} for r in requirements if r['id'] not in assigned],
+        'created_at':utc_iso(row.created_at)}
+
+
+def project_input_material(db: Session, project_id: str, material_id: str):
+    material = db.scalar(select(Material).where(Material.project_id == project_id, Material.id == material_id))
+    version = db.get(MaterialVersion, material_id) if material else None
+    original = db.get(MaterialOriginal, material_id) if material else None
+    if not material or not version or not original:
+        raise ApiError('NOT_FOUND', '找不到选择的项目资料。', 404)
+    if version.state != 'active':
+        raise ApiError('MATERIAL_WITHDRAWN', '所选模板或案例已撤回。', 409)
+    if len(material.text) > 50000:
+        raise ApiError('INPUT_TOO_LARGE', '所选模板或案例过长，请缩小范围。', 422)
+    path = DATA_DIR / 'materials' / original.filename_on_disk
+    try:
+        if original.filename_on_disk != material.id or not path.is_file(): raise OSError()
+        digest=hashlib.sha256()
+        with path.open('rb') as file:
+            for chunk in iter(lambda:file.read(1024*1024),b''):digest.update(chunk)
+        if digest.hexdigest()!=original.sha256:raise OSError()
+    except OSError:
+        raise ApiError('SOURCE_CHECK_FAILED', '所选资料原件不可用，请核对。', 409) from None
+    return material,version,original
+
+def template_for_project(db: Session, project_id: str, template_id: str):
+    if template_id=='demo-v1':
+        return TEMPLATE_PATH.read_text(encoding='utf-8'),None
+    material,version,original=project_input_material(db,project_id,template_id)
+    return material.text,(material,version,original)
+
+def outline_baseline(db, project_id, baseline_id):
+    baseline=db.scalar(select(Baseline).where(Baseline.id==baseline_id,Baseline.project_id==project_id))
+    if not baseline:raise ApiError('NOT_FOUND','找不到这份需求清单。',404)
+    try:
+        requirements=json.loads(baseline.snapshot)
+        if not isinstance(requirements,list) or not requirements:raise ValueError()
+        if any(not isinstance(r,dict) or not isinstance(r.get('id'),str) or not isinstance(r.get('text'),str) for r in requirements):raise ValueError()
+    except (ValueError,TypeError):
+        raise ApiError('INVALID_INPUT','需求清单无法读取或缺少需求。',422) from None
+    return baseline,requirements
+
+
+@app.get('/api/v1/projects/{project_id}/outlines')
+def list_outlines(project_id: str,baseline_id: str,template_id: str='demo-v1',db: Session=Depends(db_session)):
+    project_or_404(db,project_id)
+    _,requirements=outline_baseline(db,project_id,baseline_id)
+    template,_=template_for_project(db,project_id,template_id)
+    defaults=default_chapters(template, allow_generic=template_id!='demo-v1')
+    defaults_fallback=not defaults and template_id!='demo-v1'
+    if defaults_fallback:
+        defaults=default_chapters(TEMPLATE_PATH.read_text(encoding='utf-8'))
+    rows=db.scalars(select(ProposalOutline).where(ProposalOutline.project_id==project_id,ProposalOutline.baseline_id==baseline_id,ProposalOutline.template_id==template_id).order_by(ProposalOutline.version.desc()))
+    return {'defaults':defaults,'defaults_fallback':defaults_fallback,'outlines':[outline_output(row,requirements) for row in rows]}
+
+
+@app.post('/api/v1/projects/{project_id}/outlines',status_code=201)
+def create_outline(project_id: str,body: OutlineInput,db: Session=Depends(db_session)):
+    project_or_404(db,project_id)
+    baseline,requirements=outline_baseline(db,project_id,body.baseline_id)
+    from types import SimpleNamespace
+    require_draft_materials_active(db, SimpleNamespace(project_id=project_id, baseline_id=baseline.id))
+    template_for_project(db,project_id,body.template_id)
+    try:validate_chapters(body.chapters,requirements)
+    except ValueError as exc:raise ApiError('INVALID_INPUT',str(exc),422) from None
+    serialized=json.dumps([c.model_dump() for c in body.chapters],ensure_ascii=False)
+    if len(serialized)>50000:raise ApiError('INPUT_TOO_LARGE','提纲过长，请缩小范围。',422)
+    try:
+        locked=db.execute(update(Baseline).where(Baseline.id==baseline.id,Baseline.project_id==project_id).values(snapshot=Baseline.snapshot))
+        if locked.rowcount!=1:raise ApiError('VERSION_CONFLICT','需求清单已变化，请刷新。',409)
+        version=(db.scalar(select(func.max(ProposalOutline.version)).where(ProposalOutline.project_id==project_id,ProposalOutline.baseline_id==baseline.id)) or 0)+1
+        row=ProposalOutline(project_id=project_id,baseline_id=baseline.id,template_id=body.template_id,version=version,chapters=serialized,created_by=actor_id.get() if multiuser.get() else None)
+        db.add(row);db.commit();db.refresh(row)
+    except IntegrityError:
+        db.rollback();raise ApiError('VERSION_CONFLICT','提纲正在被更新，请重试保存。',409) from None
+    return outline_output(row,requirements)
+
+
+@app.get('/api/v1/projects/{project_id}/proposals/{draft_id}/outline')
+def get_draft_outline(project_id: str,draft_id: str,db: Session=Depends(db_session)):
+    draft=proposal_or_404(db,project_id,draft_id)
+    link=db.get(ProposalOutlineLink,draft.id)
+    if not link:return {'outline':None}
+    row=db.get(ProposalOutline,link.outline_id)
+    _,requirements=outline_baseline(db,project_id,draft.baseline_id)
+    return {'outline':{'id':link.outline_id,'version':row.version if row else None,'chapters':json.loads(link.snapshot),
+                       'requirement_texts':{r['id']:r['text'] for r in requirements}}}
+
+
 @app.get('/api/v1/projects/{project_id}/proposals', response_model=list[ProposalOutput])
 def list_proposals(project_id: str, db: Session = Depends(db_session)):
     project_or_404(db, project_id)
@@ -584,9 +1115,9 @@ def create_proposal(project_id: str, body: ProposalInput, background: Background
     project = project_or_404(db, project_id)
     if not body.confirm_external_use:
         raise ApiError('CONFIRMATION_REQUIRED', '请先确认资料发送和模型费用。', 400)
-    if not os.environ.get('DEEPSEEK_API_KEY', '').strip():
+    if not model_key():
         raise ApiError('MODEL_NOT_CONFIGURED', '请先在本机配置模型密钥。', 400)
-    allowed = [x.strip() for x in os.environ.get('DEEPSEEK_ALLOWED_MODELS', 'deepseek-flash').split(',') if x.strip()]
+    allowed, _ = model_settings(db)
     if body.model_name not in allowed:
         raise ApiError('MODEL_NOT_ALLOWED', '此模型未在允许列表中。', 422)
     baseline = db.scalar(select(Baseline).where(Baseline.id == body.baseline_id, Baseline.project_id == project_id))
@@ -596,31 +1127,66 @@ def create_proposal(project_id: str, body: ProposalInput, background: Background
     if not requirements:
         raise ApiError('NO_CONFIRMED_REQUIREMENTS', '请选择含有已确认需求的清单。', 422)
     questions = db.get(BaselineQuestions, baseline.id)
-    material_names = {m.id: m.filename for m in db.scalars(select(Material).where(Material.project_id == project_id))}
+    material_names = {m.id: material_display_name(db,m) for m in db.scalars(select(Material).where(Material.project_id == project_id))}
     def readable_sources(entry):
         sources = [entry] + entry.get('related_sources', [])
         return [{'资料名称': material_names.get(source.get('material_id'), '来源资料待核对'), '原文': source.get('quote', '')}
                 for source in sources if source.get('material_id') or source.get('quote')]
-    readable_requirements = [{'需求内容': entry.get('text', ''), '已有资料出处': readable_sources(entry)} for entry in requirements]
+    readable_requirements = [{'需求内容': entry.get('text', ''), '来源类型': '人工输入并经负责人确认' if entry.get('origin') == 'manual' else '资料整理', '已有资料出处': readable_sources(entry)} for entry in requirements]
     status_names = {'pending': '待确认', 'answered': '已答复，问题尚未解决', 'resolved': '已解决'}
     facts_record = db.get(BaselineFacts, baseline.id)
     baseline_facts = json.loads(facts_record.snapshot) if facts_record else []
     readable_facts = [{'事实内容': entry.get('text', ''), '已有资料出处': [{'资料名称': source['资料名称']} for source in readable_sources(entry)]} for entry in baseline_facts]
+    all_entries = requirements + baseline_facts + (json.loads(questions.snapshot) if questions else [])
+    db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+    require_active_materials(db, project_id, [source.get('material_id') for entry in all_entries for source in [entry] + (entry.get('related_sources') or [])])
     readable_questions = [{'问题': entry.get('text', ''), '状态': status_names.get(entry.get('status'), '待确认'),
                            '答复': entry.get('answer', ''), '已有资料出处': readable_sources(entry)}
                           for entry in (json.loads(questions.snapshot) if questions else [])]
     payload = {'项目名称': project.name, '已确认需求': readable_requirements, '已核对资料事实': readable_facts, '未解决问题': readable_questions}
+    outline=None
+    if body.outline_id:
+        outline=db.scalar(select(ProposalOutline).where(ProposalOutline.id==body.outline_id,ProposalOutline.project_id==project_id,
+            ProposalOutline.baseline_id==baseline.id,ProposalOutline.template_id==body.template_id))
+        if not outline:raise ApiError('NOT_FOUND','找不到匹配当前需求清单和模板的提纲。',404)
+        try:
+            chapters=[OutlineChapter.model_validate(x) for x in json.loads(outline.chapters)]
+            validate_chapters(chapters,requirements)
+            names={r['id']:r['text'] for r in requirements}
+            payload['方案提纲']=[{'章节标题':chapter.title,'写作要求':chapter.instruction,
+                '计划响应需求':[names[rid] for rid in chapter.requirement_ids]} for chapter in chapters]
+        except (ValueError,TypeError,KeyError):
+            raise ApiError('INVALID_INPUT','提纲或需求清单无法核对。',422) from None
     if body.include_example:
         payload['虚构参考案例（仅供方法参考，不是项目事实或业绩）'] = EXAMPLE_PATH.read_text(encoding='utf-8')
+    case_sources=[]
+    if len(set(body.case_ids))!=len(body.case_ids):
+        raise ApiError('INVALID_INPUT','参考案例不能重复选择。',422)
+    for case_id in body.case_ids:
+        case=project_input_material(db,project_id,case_id)
+        case_sources.append(case)
+    if case_sources:
+        payload['选用的参考案例（仅作写法参考，不能推定为本项目事实）']=[{'资料名称':material_display_name(db,case[0],case[1]),'资料内容':case[0].text} for case in case_sources]
     serialized = json.dumps(payload, ensure_ascii=False)
     if len(serialized) > 60000:
         raise ApiError('INPUT_TOO_LARGE', '需求清单过长，请先缩小范围后再生成。', 422)
-    template = TEMPLATE_PATH.read_text(encoding='utf-8')
-    draft = ProposalDraft(project_id=project_id, baseline_id=baseline.id, template_id=body.template_id, template_snapshot=template, input_snapshot=serialized, model_name=body.model_name)
+    template,template_source = template_for_project(db,project_id,body.template_id)
+    draft = ProposalDraft(project_id=project_id, baseline_id=baseline.id, template_id=body.template_id, template_snapshot=template, input_snapshot=serialized, model_name=body.model_name, created_by=actor_id.get() if multiuser.get() else None)
     db.add(draft)
+    db.flush()
+    for kind, source in ([('template',template_source)] if template_source else []) + [('case',case) for case in case_sources]:
+        material,version,original=source
+        db.add(ProposalInputSource(project_id=project_id,draft_id=draft.id,material_id=material.id,kind=kind,version=version.version,state_version=version.state_version,file_hash=original.sha256,text_hash=hashlib.sha256(material.text.encode('utf-8')).hexdigest()))
+    if outline:
+        db.add(ProposalOutlineLink(draft_id=draft.id,outline_id=outline.id,snapshot=outline.chapters))
+    if body.model_name == 'deepseek-flash':
+        db.add(ProposalPricing(draft_id=draft.id, input_per_million='0.30', output_per_million='1.20', pricing_date='2026-10-27'))
+    if multiuser.get():
+        enqueue(db, project_id, actor_id.get(), 'proposal', draft.id)
     db.commit()
     db.refresh(draft)
-    background.add_task(run_proposal, draft.id)
+    if not multiuser.get():
+        background.add_task(run_proposal, draft.id)
     return proposal_output(draft)
 
 @app.patch('/api/v1/projects/{project_id}/proposals/{draft_id}', response_model=ProposalOutput)
@@ -642,10 +1208,241 @@ def edit_proposal(project_id: str, draft_id: str, body: ProposalEdit, db: Sessio
     if result.rowcount != 1:
         db.rollback()
         raise ApiError('VERSION_CONFLICT', '初稿已更新，请刷新后重试。', 409)
-    db.add(ProposalRevision(draft_id=draft_id, version=body.version, content=old_content))
+    db.add(ProposalRevision(draft_id=draft_id, version=body.version, content=old_content, actor_id=actor_id.get() if multiuser.get() else None))
     db.commit()
     db.refresh(draft)
     return proposal_output(draft)
+
+class SectionEditInput(BaseModel):
+    version: int = Field(ge=1)
+    section_id: str = Field(min_length=1, max_length=100)
+    instruction: str = Field(min_length=1, max_length=3000)
+    model_name: str = Field(default='deepseek-flash', max_length=100)
+    confirm_external_use: bool = False
+
+class SectionAcceptInput(BaseModel):
+    version: int = Field(ge=1)
+
+
+def section_edit_output(task: SectionEdit):
+    return {'id':task.id, 'draft_id':task.draft_id, 'base_version':task.base_version,
+            'section_title':task.section_title, 'instruction':task.instruction, 'original':task.original,
+            'candidate':task.candidate, 'suggestions':json.loads(task.suggestions), 'status':task.status,
+            'error':task.error, 'model_name':task.model_name, 'calls':task.calls,
+            'prompt_tokens':task.prompt_tokens, 'completion_tokens':task.completion_tokens,
+            'elapsed_ms':task.elapsed_ms, 'created_at':task.created_at.isoformat(),
+            'decision_actor_id': task.decision_actor_id, 'decided_at': task.decided_at.isoformat() if task.decided_at else None}
+
+
+@app.get('/api/v1/projects/{project_id}/proposals/{draft_id}/revisions')
+def proposal_revisions(project_id: str, draft_id: str, db: Session = Depends(db_session)):
+    proposal_or_404(db, project_id, draft_id)
+    rows = db.scalars(select(ProposalRevision).where(ProposalRevision.draft_id == draft_id).order_by(ProposalRevision.version.desc()))
+    return [{'version': row.version, 'content': row.content, 'created_at': row.created_at.isoformat()} for row in rows]
+
+
+@app.get('/api/v1/projects/{project_id}/proposals/{draft_id}/sections')
+def list_proposal_sections(project_id: str, draft_id: str, db: Session = Depends(db_session)):
+    draft = proposal_or_404(db, project_id, draft_id)
+    return {'version':draft.version, 'sections':[{'id':x['id'],'title':x['title'],'level':x['level']} for x in sections(draft.content)]}
+
+
+@app.post('/api/v1/projects/{project_id}/proposals/{draft_id}/section-edits', status_code=202)
+def create_section_edit(project_id: str, draft_id: str, body: SectionEditInput, background: BackgroundTasks, db: Session = Depends(db_session)):
+    draft = proposal_or_404(db, project_id, draft_id)
+    if not body.confirm_external_use:
+        raise ApiError('CONFIRMATION_REQUIRED', '请先确认发送内容和模型费用。', 400)
+    if body.version != draft.version:
+        raise ApiError('VERSION_CONFLICT', '方案已更新，请刷新后重试。', 409)
+    if not body.instruction.strip():
+        raise ApiError('INVALID_INPUT', '请填写修改要求。', 422)
+    if not model_key():
+        raise ApiError('MODEL_NOT_CONFIGURED', '请先在本机配置模型密钥。', 400)
+    allowed, limit = model_settings(db)
+    if body.model_name not in allowed or limit < 1:
+        raise ApiError('MODEL_NOT_ALLOWED', '模型不可使用。', 422)
+    target = next((x for x in sections(draft.content) if x['id'] == body.section_id), None)
+    if not target or target['start'] > len(draft.content) or not draft.content[target['start']-1:target['start']] == '\n':
+        raise ApiError('INVALID_SECTION', '无法确定章节边界，请先检查方案格式。', 422)
+    original = draft.content[target['start']:target['end']]
+    require_draft_materials_active(db, draft)
+    context = draft.input_snapshot
+    if len(original) > 50000 or len(context) > 60000:
+        raise ApiError('INPUT_TOO_LARGE', '章节或依据过长，不能发起修改。', 422)
+    task = SectionEdit(project_id=project_id, draft_id=draft_id, actor_id=actor_id.get(), base_version=draft.version,
+        section_id=target['id'], section_title=target['title'], section_level=target['level'],
+        start_offset=target['start'], end_offset=target['end'], original=original, instruction=body.instruction.strip(),
+        context=context, model_name=body.model_name)
+    db.add(task)
+    db.flush()
+    if multiuser.get():
+        enqueue(db, project_id, actor_id.get(), 'section_edit', task.id)
+    db.commit()
+    db.refresh(task)
+    if not multiuser.get():
+        background.add_task(run_section_edit, task.id)
+    return section_edit_output(task)
+
+
+@app.get('/api/v1/projects/{project_id}/proposals/{draft_id}/section-edits')
+def list_section_edits(project_id: str, draft_id: str, db: Session = Depends(db_session)):
+    proposal_or_404(db, project_id, draft_id)
+    return [section_edit_output(x) for x in db.scalars(select(SectionEdit).where(SectionEdit.project_id==project_id, SectionEdit.draft_id==draft_id).order_by(SectionEdit.created_at.desc()))]
+
+
+def section_edit_or_404(db, project_id, task_id):
+    project_or_404(db, project_id)
+    task = db.scalar(select(SectionEdit).where(SectionEdit.id == task_id, SectionEdit.project_id == project_id))
+    if not task:
+        raise ApiError('NOT_FOUND', '找不到这项章节修改。', 404)
+    return task
+
+
+@app.post('/api/v1/projects/{project_id}/section-edits/{task_id}/accept')
+def accept_section_edit(project_id: str, task_id: str, body: SectionAcceptInput, db: Session = Depends(db_session)):
+    task = section_edit_or_404(db, project_id, task_id)
+    draft = proposal_or_404(db, project_id, task.draft_id)
+    if task.status != 'completed':
+        raise ApiError('INVALID_STATE', '只有已完成的候选修改才能接受。', 409)
+    if body.version != task.base_version or draft.version != task.base_version:
+        raise ApiError('VERSION_CONFLICT', '方案已更新，候选仍可查看，但不能直接应用。', 409)
+    if draft.content[task.start_offset:task.end_offset] != task.original or not valid_candidate(task.candidate,task.section_level):
+        raise ApiError('VERSION_CONFLICT', '原章节已变化或候选格式无效，无法应用。', 409)
+    old_content = draft.content
+    replacement = task.candidate.rstrip() + ('\n\n' if task.end_offset < len(old_content) else '\n')
+    content = old_content[:task.start_offset] + replacement + old_content[task.end_offset:]
+    if len(content)>100000:
+        raise ApiError('INPUT_TOO_LARGE', '接受后方案过长，无法保存。', 422)
+    changed = db.execute(update(ProposalDraft).where(ProposalDraft.id==draft.id, ProposalDraft.version==task.base_version, ProposalDraft.content==old_content).values(content=content,version=task.base_version+1))
+    if changed.rowcount != 1:
+        db.rollback()
+        raise ApiError('VERSION_CONFLICT', '方案已更新，候选仍可查看。', 409)
+    accepted = db.execute(update(SectionEdit).where(SectionEdit.id==task.id, SectionEdit.status=='completed').values(status='accepted',decision_actor_id=actor_id.get(),decided_at=now()))
+    if accepted.rowcount != 1:
+        db.rollback()
+        raise ApiError('VERSION_CONFLICT', '候选状态已变化，请刷新。', 409)
+    db.add(ProposalRevision(draft_id=draft.id,version=task.base_version,content=old_content,actor_id=actor_id.get() if multiuser.get() else None))
+    db.commit()
+    db.refresh(draft)
+    return proposal_output(draft)
+
+
+@app.post('/api/v1/projects/{project_id}/section-edits/{task_id}/discard')
+def discard_section_edit(project_id: str, task_id: str, db: Session = Depends(db_session)):
+    task = section_edit_or_404(db,project_id,task_id)
+    result = db.execute(update(SectionEdit).where(SectionEdit.id==task.id, SectionEdit.status=='completed').values(status='discarded',decision_actor_id=actor_id.get(),decided_at=now()))
+    if result.rowcount != 1:
+        db.rollback()
+        raise ApiError('INVALID_STATE', '只有已完成的候选修改可以放弃。', 409)
+    db.commit()
+    db.refresh(task)
+    return section_edit_output(task)
+
+class ConsistencyInput(BaseModel):
+    version: int = Field(ge=1)
+    model_name: str | None = Field(default=None, min_length=1, max_length=100)
+    confirm_external_use: bool = False
+
+class ConsistencyDecisionInput(BaseModel):
+    check_version: int = Field(ge=1)
+    issue_version: int = Field(ge=1)
+    status: Literal['pending','resolved','dismissed']
+    note: str = Field(default='',max_length=2000)
+
+
+def consistency_source_signature(db, draft):
+    try:
+        sources=source_snapshot(db,draft,TEMPLATE_PATH,EXAMPLE_PATH)
+        return json.dumps(sources,ensure_ascii=False,sort_keys=True), ''
+    except SourceCheckError as exc:
+        return '', str(exc)
+
+
+def consistency_output(db, check, draft, signature=None):
+    if signature is None:
+        signature=consistency_source_signature(db,draft)
+    stale=check.base_version!=draft.version or (check.source_signature,check.source_warning)!=signature
+    issues=[]
+    for item in db.scalars(select(ConsistencyIssue).where(ConsistencyIssue.check_id==check.id).order_by(ConsistencyIssue.id)):
+        actor=db.get(UserAccount,item.decision_actor_id) if item.decision_actor_id else None
+        ambiguous=bool(item.location_quote and check.content.count(item.location_quote)>1)
+        offset=check.content.find(item.location_quote) if item.location_quote and not ambiguous else -1
+        containing=[section for section in sections(check.content) if section['start']<=offset<section['end']]
+        chapter=max(containing,key=lambda section:section['level'])['title'] if containing else ''
+        line=check.content.count('\n',0,offset)+1 if offset>=0 else None
+        inputs=json.loads(check.context)
+        def includes_quote(value):
+            if isinstance(value,str): return item.evidence_quote in value
+            if isinstance(value,dict): return any(includes_quote(v) for v in value.values())
+            if isinstance(value,list): return any(includes_quote(v) for v in value)
+            return False
+        evidence_kind=next((key for key,value in inputs.items() if includes_quote(value)), '方案正文' if item.evidence_quote in check.content else '待核对')
+        issues.append({'id':item.id,'category':item.category,'description':item.description,
+            'location_quote':item.location_quote,'location_chapter':chapter,'location_line':line,'location_ambiguous':ambiguous,
+            'evidence_quote':item.evidence_quote,'evidence_kind':evidence_kind,'status':item.status,
+            'decision_note':item.decision_note,'decision_actor':actor.username if actor else ('本机操作' if item.decision_actor_id else ''),
+            'decided_at':utc_iso(item.decided_at) if item.decided_at else None,'version':item.version})
+    return {'id':check.id,'base_version':check.base_version,'stale':stale,'source_warning':check.source_warning,
+            'status':check.status,'error':check.error,'calls':check.calls,'prompt_tokens':check.prompt_tokens,
+            'completion_tokens':check.completion_tokens,'model_name':check.model_name,'created_at':utc_iso(check.created_at),'issues':issues}
+
+
+@app.post('/api/v1/projects/{project_id}/proposals/{draft_id}/consistency-checks',status_code=202)
+def create_consistency_check(project_id: str, draft_id: str, body: ConsistencyInput, background: BackgroundTasks, db: Session = Depends(db_session)):
+    draft=proposal_or_404(db,project_id,draft_id)
+    if not body.confirm_external_use:raise ApiError('CONFIRMATION_REQUIRED','请先确认发送内容和模型费用。',400)
+    if draft.version!=body.version:raise ApiError('VERSION_CONFLICT','方案已更新，请刷新后重新检查。',409)
+    if not model_key():raise ApiError('MODEL_NOT_CONFIGURED','请先在本机配置模型密钥。',400)
+    allowed,limit=model_settings(db)
+    model_name=body.model_name or (allowed[0] if allowed else '')
+    if model_name not in allowed or limit<1:raise ApiError('MODEL_NOT_ALLOWED','模型不可使用。',422)
+    try:
+        raw=json.loads(draft.input_snapshot)
+        if not isinstance(raw,dict):raise ValueError()
+        context=json.dumps({key:raw.get(key,[]) for key in ('已确认需求','已核对资料事实','未解决问题')},ensure_ascii=False)
+    except (ValueError,TypeError):
+        raise ApiError('INVALID_INPUT','方案的需求依据无法读取，请重新生成方案。',422) from None
+    require_draft_materials_active(db, draft)
+    if len(draft.content)>100000 or len(context)>60000:raise ApiError('INPUT_TOO_LARGE','方案或依据过长，暂不能检查。',422)
+    lock_proposal_version(db,draft,body.version)
+    signature,warning=consistency_source_signature(db,draft)
+    task=ConsistencyCheck(project_id=project_id,draft_id=draft_id,actor_id=actor_id.get(),base_version=draft.version,
+        content=draft.content,context=context,source_signature=signature,source_warning=warning,model_name=model_name)
+    db.add(task);db.flush()
+    if multiuser.get():enqueue(db,project_id,actor_id.get(),'consistency',task.id)
+    db.commit();db.refresh(task)
+    if not multiuser.get():background.add_task(run_consistency_check,task.id)
+    return consistency_output(db,task,draft,(signature,warning))
+
+
+@app.get('/api/v1/projects/{project_id}/proposals/{draft_id}/consistency-checks')
+def list_consistency_checks(project_id: str,draft_id: str,db: Session=Depends(db_session)):
+    draft=proposal_or_404(db,project_id,draft_id)
+    signature=consistency_source_signature(db,draft)
+    return [consistency_output(db,task,draft,signature) for task in db.scalars(select(ConsistencyCheck).where(ConsistencyCheck.project_id==project_id,ConsistencyCheck.draft_id==draft_id).order_by(ConsistencyCheck.created_at.desc()))]
+
+
+@app.patch('/api/v1/projects/{project_id}/consistency-checks/{check_id}/issues/{issue_id}')
+def decide_consistency_issue(project_id: str,check_id: str,issue_id: str,body: ConsistencyDecisionInput,db: Session=Depends(db_session)):
+    project_or_404(db,project_id)
+    check=db.scalar(select(ConsistencyCheck).where(ConsistencyCheck.id==check_id,ConsistencyCheck.project_id==project_id))
+    issue=db.scalar(select(ConsistencyIssue).where(ConsistencyIssue.id==issue_id,ConsistencyIssue.check_id==check_id))
+    if not check or not issue:raise ApiError('NOT_FOUND','找不到这条检查结果。',404)
+    draft=proposal_or_404(db,project_id,check.draft_id)
+    if check.status!='completed':raise ApiError('INVALID_STATE','检查完成后才能处理结果。',409)
+    if body.check_version!=check.base_version or draft.version!=check.base_version:
+        raise ApiError('VERSION_CONFLICT','方案已更新，旧检查结果仅供查看。',409)
+    if issue.version!=body.issue_version:raise ApiError('VERSION_CONFLICT','处理状态已变化，请刷新。',409)
+    if body.status!='pending' and not body.note.strip():raise ApiError('INVALID_INPUT','请填写处理说明。',422)
+    lock_proposal_version(db,draft,check.base_version)
+    if (check.source_signature,check.source_warning)!=consistency_source_signature(db,draft):
+        db.rollback();raise ApiError('SOURCE_REVIEW_REQUIRED','方案依据已变化，旧检查结果仅供查看。',409)
+    changed=db.execute(update(ConsistencyIssue).where(ConsistencyIssue.id==issue.id,ConsistencyIssue.version==body.issue_version)
+        .values(status=body.status,decision_note=body.note.strip(),decision_actor_id=actor_id.get(),decided_at=now(),version=body.issue_version+1))
+    if changed.rowcount!=1:
+        db.rollback();raise ApiError('VERSION_CONFLICT','处理状态已变化，请刷新。',409)
+    db.commit();db.refresh(check)
+    return consistency_output(db,check,draft)
 
 class ReviewDecisionInput(BaseModel):
     question_id: str = Field(min_length=1, max_length=100)
@@ -685,6 +1482,7 @@ class ReviewHistoryOutput(BaseModel):
     note: str
     decisions: list[ReviewDecisionInput]
     created_at: str
+    actor_name: str = '本机操作'
 
 class ExportInput(BaseModel):
     version: int = Field(ge=1)
@@ -752,15 +1550,139 @@ def utc_iso(value):
 def get_proposal_review(project_id: str, draft_id: str, db: Session = Depends(db_session)):
     return review_output(db, proposal_or_404(db, project_id, draft_id))
 
+class ProjectTodoOutput(BaseModel):
+    pending_requirements: int
+    pending_reviews: int
+    needs_review: int
+    unknown_reviews: int
+
+@app.get('/api/v1/projects/{project_id}/todo', response_model=ProjectTodoOutput)
+def project_todo(project_id: str, db: Session = Depends(db_session)):
+    project_or_404(db, project_id)
+    pending = (db.scalar(select(func.count()).select_from(Requirement).where(
+        Requirement.project_id == project_id, Requirement.status == 'pending')) or 0) + (db.scalar(select(func.count()).select_from(ManualRequirement).where(ManualRequirement.project_id == project_id, ManualRequirement.status == 'pending')) or 0)
+    drafts = db.scalars(select(ProposalDraft).where(ProposalDraft.project_id == project_id,
+                                                    ProposalDraft.status == 'completed'))
+    submitted = needs_review = unknown = 0
+    for draft in drafts:
+        try:
+            status = review_output(db, draft).status
+        except ApiError:
+            unknown += 1
+            continue
+        if status == 'submitted':
+            submitted += 1
+        elif status == 'needs_review':
+            needs_review += 1
+    return ProjectTodoOutput(pending_requirements=pending, pending_reviews=submitted,
+                             needs_review=needs_review, unknown_reviews=unknown)
+
+class WorkItemOutput(BaseModel):
+    project_id: str
+    project_name: str
+    kind: str
+    label: str
+    status: str
+    updated_at: str | None
+    step: int
+    target_id: str | None = None
+
+@app.get('/api/v1/worklist', response_model=list[WorkItemOutput])
+def personal_worklist(db: Session = Depends(db_session)):
+    result=[]
+    for project in db.scalars(select(Project).where(Project.owner_id=='local-user').order_by(Project.created_at.desc())):
+        role=member_role(db,project.id,actor_id.get()) if multiuser.get() else 'owner'
+        if not role:
+            continue
+        state,_=current_state(db,project.id) if multiuser.get() else ('active',0)
+        if state=='trash':
+            continue
+        if role=='owner':
+            pending=(db.scalar(select(func.count()).select_from(Requirement).where(Requirement.project_id==project.id,Requirement.status=='pending')) or 0)+(db.scalar(select(func.count()).select_from(ManualRequirement).where(ManualRequirement.project_id==project.id,ManualRequirement.status=='pending')) or 0)
+            if pending:
+                result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='requirements',label=f'{pending} 条需求待确认',status='待确认',updated_at=None,step=2))
+            suggestions=db.scalar(select(func.count()).select_from(RequirementRevisionSuggestion).where(RequirementRevisionSuggestion.project_id==project.id,RequirementRevisionSuggestion.status=='pending')) or 0
+            if suggestions:
+                result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='revisions',label=f'{suggestions} 条需求修订建议待处理',status='待确认',updated_at=None,step=2))
+            for draft in db.scalars(select(ProposalDraft).where(ProposalDraft.project_id==project.id,ProposalDraft.status=='completed')):
+                try:
+                    status=review_output(db,draft).status
+                except ApiError:
+                    result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='review',label='方案审核状态暂时无法核对',status='待核对',updated_at=utc_iso(draft.created_at),step=4,target_id=draft.id))
+                    continue
+                if status in ('submitted','needs_review'):
+                    result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='review',label='方案待审核' if status=='submitted' else '方案依据需重新核对',status='待审核' if status=='submitted' else '待核对',updated_at=utc_iso(draft.created_at),step=4,target_id=draft.id))
+        for draft in db.scalars(select(ProposalDraft).where(ProposalDraft.project_id==project.id,ProposalDraft.created_by==actor_id.get(),ProposalDraft.status=='completed')):
+            try:
+                draft_status=review_output(db,draft).status
+            except ApiError:
+                continue
+            if draft_status=='returned':
+                result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='returned',label='方案已退回，请修改',status='待修改',updated_at=utc_iso(draft.created_at),step=4,target_id=draft.id))
+        for task in db.scalars(select(AnalysisTask).where(AnalysisTask.project_id==project.id,AnalysisTask.created_by==actor_id.get(),AnalysisTask.status.in_(['pending','running','failed','interrupted','paused_limit']))):
+            result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='analysis',label='我的需求整理任务',status=task.status,updated_at=utc_iso(task.created_at),step=2,target_id=task.id))
+        for draft in db.scalars(select(ProposalDraft).where(ProposalDraft.project_id==project.id,ProposalDraft.created_by==actor_id.get(),ProposalDraft.status.in_(['pending','running','failed','interrupted']))):
+            result.append(WorkItemOutput(project_id=project.id,project_name=project.name,kind='proposal',label='我的方案生成任务',status=draft.status,updated_at=utc_iso(draft.created_at),step=3,target_id=draft.id))
+    return result[:200]
+
+class ProjectActivityOutput(BaseModel):
+    action: str
+    actor: str
+    created_at: str
+    object_type: str
+
+@app.get('/api/v1/projects/{project_id}/activity', response_model=list[ProjectActivityOutput])
+def project_activity(project_id: str, db: Session = Depends(db_session)):
+    project_or_404(db,project_id)
+    events=[]
+    def add(rows, object_type, actor_attr, action_fn):
+        for row in rows:
+            actor_id_value=getattr(row,actor_attr)
+            actor=db.get(UserAccount,actor_id_value) if actor_id_value else None
+            events.append(ProjectActivityOutput(action=action_fn(row),actor=actor.username if actor else '本机操作',created_at=utc_iso(row.created_at),object_type=object_type))
+    add(db.scalars(select(Material).where(Material.project_id==project_id)), '资料','created_by',lambda r:'添加资料')
+    add(db.scalars(select(MaterialStateEvent).where(MaterialStateEvent.project_id==project_id)), '资料','actor',lambda r:'撤回资料' if r.action=='withdraw' else '恢复资料')
+    add(db.scalars(select(MembershipEvent).where(MembershipEvent.project_id==project_id)), '成员','actor_id',lambda r:'成员或负责人变更')
+    add(db.scalars(select(ProposalReviewEvent).where(ProposalReviewEvent.project_id==project_id)), '方案审核','actor',lambda r:{'submitted':'提交审核','approved':'审核通过','returned':'退回修改'}.get(r.action,'审核状态变更'))
+    add(db.scalars(select(ProposalExportEvent).where(ProposalExportEvent.project_id==project_id)), '方案导出','actor',lambda r:'导出审核版' if r.kind=='approved' else '导出草稿')
+    suggestions=list(db.scalars(select(RequirementRevisionSuggestion).where(RequirementRevisionSuggestion.project_id==project_id)))
+    add(suggestions, '需求修订','created_by',lambda r:'提交修订建议')
+    for item in suggestions:
+        if item.decided_at and item.decided_by:
+            actor=db.get(UserAccount,item.decided_by)
+            events.append(ProjectActivityOutput(action='采用修订建议' if item.status=='accepted' else '驳回修订建议',actor=actor.username if actor else '本机操作',created_at=utc_iso(item.decided_at),object_type='需求修订'))
+    add(db.scalars(select(ManualRequirement).where(ManualRequirement.project_id==project_id)), '人工需求','created_by',lambda r:'添加人工需求')
+    add(db.scalars(select(Baseline).where(Baseline.project_id==project_id)), '需求清单','created_by',lambda r:'生成需求清单')
+    add(db.scalars(select(AnalysisTask).where(AnalysisTask.project_id==project_id,AnalysisTask.status.in_(['failed','interrupted']))), '需求任务','created_by',lambda r:'发起的整理任务当前未完成')
+    add(db.scalars(select(ProposalDraft).where(ProposalDraft.project_id==project_id,ProposalDraft.status.in_(['failed','interrupted']))), '方案任务','created_by',lambda r:'发起的生成任务当前未完成')
+    add(db.scalars(select(SectionEdit).where(SectionEdit.project_id==project_id,SectionEdit.status.in_(['failed','interrupted']))), '章节任务','actor_id',lambda r:'发起的修改任务当前未完成')
+    add(db.scalars(select(ConsistencyCheck).where(ConsistencyCheck.project_id==project_id,ConsistencyCheck.status.in_(['failed','interrupted']))), '检查任务','actor_id',lambda r:'发起的检查任务当前未完成')
+    draft_ids=select(ProposalDraft.id).where(ProposalDraft.project_id==project_id)
+    add(db.scalars(select(ProposalRevision).where(ProposalRevision.draft_id.in_(draft_ids))), '方案','actor_id',lambda r:'保存方案修改')
+    task_ids=select(AnalysisTask.id).where(AnalysisTask.project_id==project_id)
+    add(db.scalars(select(TaskAttempt).where(TaskAttempt.task_id.in_(task_ids),TaskAttempt.status.in_(['failed','rejected']))), '模型请求','actor_id',lambda r:'发起的模型请求失败')
+    manual_ids=select(ManualRequirement.id).where(ManualRequirement.project_id==project_id)
+    add(db.scalars(select(ManualRequirementEvent).where(ManualRequirementEvent.requirement_id.in_(manual_ids))), '人工需求','actor',lambda r:'处理人工需求')
+    req_ids=select(Requirement.id).where(Requirement.project_id==project_id)
+    add(db.scalars(select(RequirementDecision).where(RequirementDecision.requirement_id.in_(req_ids))), '需求','actor',lambda r:'处理需求')
+    return sorted(events,key=lambda x:x.created_at,reverse=True)[:100]
+
 @app.get('/api/v1/projects/{project_id}/proposals/{draft_id}/review-history', response_model=list[ReviewHistoryOutput])
 def get_proposal_review_history(project_id: str, draft_id: str, db: Session = Depends(db_session)):
     draft = proposal_or_404(db, project_id, draft_id)
     events = db.scalars(select(ProposalReviewEvent).where(ProposalReviewEvent.draft_id == draft.id, ProposalReviewEvent.project_id == project_id).order_by(ProposalReviewEvent.created_at.desc(), ProposalReviewEvent.id.desc()))
-    return [ReviewHistoryOutput(version=e.version, action=e.action, note=e.note, decisions=json.loads(e.decisions), created_at=utc_iso(e.created_at)) for e in events]
+    result = []
+    for event in events:
+        actor = db.get(UserAccount, event.actor)
+        result.append(ReviewHistoryOutput(version=event.version, action=event.action, note=event.note,
+            decisions=json.loads(event.decisions), created_at=utc_iso(event.created_at), actor_name=actor.username if actor else '本机操作'))
+    return result
 
 @app.post('/api/v1/projects/{project_id}/proposals/{draft_id}/review', response_model=ReviewOutput)
 def act_on_proposal_review(project_id: str, draft_id: str, body: ReviewActionInput, db: Session = Depends(db_session)):
     draft = proposal_or_404(db, project_id, draft_id)
+    if body.action != 'submit':
+        require_project_owner(db, project_id)
     lock_proposal_version(db, draft, body.version)
     event = latest_review(db, draft)
     try:
@@ -797,12 +1719,19 @@ def act_on_proposal_review(project_id: str, draft_id: str, body: ReviewActionInp
             if any(not d.reason.strip() or (d.disposition == 'general_approved' and d.classification != 'general') for d in body.decisions):
                 raise ApiError('UNRESOLVED_QUESTIONS', '请填写处理说明；关键问题不能按一般事项保留。', 409)
             action, decisions, note = 'approved', [d.model_dump() for d in body.decisions], body.note.strip()
-    db.add(ProposalReviewEvent(project_id=project_id, draft_id=draft.id, version=draft.version, action=action, note=note, decisions=json.dumps(decisions, ensure_ascii=False), sources=json.dumps(sources, ensure_ascii=False, sort_keys=True)))
+    db.add(ProposalReviewEvent(project_id=project_id, draft_id=draft.id, version=draft.version, action=action, note=note, decisions=json.dumps(decisions, ensure_ascii=False), sources=json.dumps(sources, ensure_ascii=False, sort_keys=True), actor=actor_id.get()))
     db.commit()
     return review_output(db, draft)
 
 @app.post('/api/v1/projects/{project_id}/proposals/{draft_id}/export')
 def export_proposal(project_id: str, draft_id: str, body: ExportInput, db: Session = Depends(db_session)):
+    return prepare_proposal_export(project_id, draft_id, body, db)
+
+@app.post('/api/v1/projects/{project_id}/proposals/{draft_id}/document-preview')
+def preview_proposal_document(project_id: str, draft_id: str, body: ExportInput, db: Session = Depends(db_session)):
+    return prepare_proposal_export(project_id, draft_id, body, db, preview_only=True)
+
+def prepare_proposal_export(project_id: str, draft_id: str, body: ExportInput, db: Session, preview_only: bool = False):
     from urllib.parse import quote
     draft = proposal_or_404(db, project_id, draft_id)
     lock_proposal_version(db, draft, body.version)
@@ -837,7 +1766,7 @@ def export_proposal(project_id: str, draft_id: str, body: ExportInput, db: Sessi
             for ref in [entry] + (entry.get('related_sources') or []):
                 material = materials.get(ref.get('material_id'))
                 if material:
-                    names[material.id.lower()] = material.filename
+                    names[material.id.lower()] = material_display_name(db, material)
                     if material.id not in original_valid:
                         original = db.get(MaterialOriginal, material.id)
                         path = DATA_DIR / 'materials' / material.id
@@ -849,10 +1778,15 @@ def export_proposal(project_id: str, draft_id: str, body: ExportInput, db: Sessi
                                     digest.update(chunk)
                             valid = digest.hexdigest() == original.sha256
                         original_valid[material.id] = valid
+                    source_version = db.get(MaterialVersion, material.id)
+                    source_location = citation_location(db, project_id, material.id, ref.get('quote', ''))
+                    source_name = material_display_name(db, material, source_version)
+                    if source_location:
+                        source_name += f' · {source_location}'
                     if ref.get('quote') and original_valid[material.id] and align_quote(ref['quote'], material.text):
-                        citations.append((material.filename, ref['quote']))
+                        citations.append((source_name, ref['quote']))
                     elif ref.get('quote'):
-                        citations.append((material.filename, '资料不可用或已变化，请核对。'))
+                        citations.append((source_name, '资料不可用或已变化，请核对。'))
         from datetime import timezone
         created = baseline.created_at if baseline.created_at.tzinfo else baseline.created_at.replace(tzinfo=timezone.utc)
         baseline_description = f'{len(requirements)} 条需求，生成于 {created.astimezone().strftime("%Y-%m-%d %H:%M")}'
@@ -861,7 +1795,28 @@ def export_proposal(project_id: str, draft_id: str, body: ExportInput, db: Sessi
         raise ApiError('EXPORT_FAILED', '方案内容暂时无法导出，请检查后重试。', 422) from None
     except Exception:
         raise ApiError('EXPORT_FAILED', '导出失败，请稍后重试。', 500) from None
-    db.add(ProposalExportEvent(project_id=project_id, draft_id=draft.id, version=draft.version, kind=body.kind))
+    if preview_only:
+        db.rollback()
+        try:
+            rendered = render_word_pdf(output)
+        except DocumentRenderError as exc:
+            raise ApiError('DOCUMENT_PREVIEW_FAILED', str(exc), 503) from None
+        return Response(content=rendered, media_type='application/pdf', headers={'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'})
+    db.add(ProposalExportEvent(project_id=project_id, draft_id=draft.id, version=draft.version, kind=body.kind, actor=actor_id.get()))
     db.commit()
     filename = '方案草稿.docx' if body.kind == 'draft' else '已审核方案.docx'
     return Response(content=output, media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document', headers={'Content-Disposition': "attachment; filename*=UTF-8''" + quote(filename)})
+
+# Experimental mode is deliberately disabled by default. Do not expose it beyond
+# isolated local testing until queue, lifecycle, and the complete UI are wired.
+if os.environ.get('QISHU_EXPERIMENTAL_MULTIUSER') == '1':
+    from .collaboration_api import CollaborationError, router as collaboration_router
+    from .multiuser_gate import install_gate
+
+    app.include_router(collaboration_router)
+
+    @app.exception_handler(CollaborationError)
+    async def collaboration_error(request: Request, exc: CollaborationError):
+        return JSONResponse(status_code=exc.status, content={'error': {'code': exc.code, 'message': exc.message}})
+
+    install_gate(app)

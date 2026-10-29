@@ -45,3 +45,33 @@ def test_quote_alignment_ignores_only_whitespace():
     assert align_quote('负责人 确认完成', '由负责人\n确认完成。') == '负责人\n确认完成'
     assert align_quote('负责人批准完成', '由负责人\n确认完成。') is None
     assert align_quote('  \n ', '任意内容') is None
+
+def test_docx_reports_location_of_merged_table():
+    doc = Document()
+    doc.add_paragraph('项目背景')
+    table = doc.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = '字段'
+    table.cell(0, 1).text = '说明'
+    table.cell(1, 0).merge(table.cell(1, 1)).text = '待确认'
+    content = io.BytesIO()
+    doc.save(content)
+    text, warning = parse_content('虚构.docx', content.getvalue())
+    assert '[第1段]' in text and '[第1表]' in text
+    assert '第1表含合并或嵌套单元格' in warning
+
+
+def test_pdf_reports_image_page_with_readable_text():
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    image_data = io.BytesIO()
+    Image.new('RGB', (4, 4), color='white').save(image_data, format='PNG')
+    image_data.seek(0)
+    content = io.BytesIO()
+    pdf = canvas.Canvas(content)
+    pdf.drawString(30, 700, 'Text present on image page')
+    pdf.drawImage(ImageReader(image_data), 30, 650, width=10, height=10)
+    pdf.save()
+    text, warning = parse_content('虚构.pdf', content.getvalue())
+    assert 'Text present on image page' in text
+    assert '检测到图片的页面（图片内容未识别）：1' in warning

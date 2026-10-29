@@ -9,11 +9,11 @@ import { gfm } from 'turndown-plugin-gfm';
 const converter = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced', bulletListMarker: '-' });
 converter.use(gfm);
 
-type Props = { content: string; editing: boolean; projectId: string; materialNames: Record<string, string>; onChange: (content: string) => void };
+type Props = { content: string; editing: boolean; projectId: string; materialNames: Record<string, string>; legacyMaterialNames?: Record<string, string>; onChange: (content: string) => void };
 
 const uuidPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 
-function readableDocument(html: string, materialNames: Record<string, string>, projectId: string, editing: boolean) {
+function readableDocument(html: string, materialNames: Record<string, string>, legacyMaterialNames: Record<string, string>, projectId: string, editing: boolean) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   for (const table of doc.querySelectorAll('table')) {
     const header = table.querySelector('thead tr');
@@ -56,7 +56,10 @@ function readableDocument(html: string, materialNames: Record<string, string>, p
   }
   if (!editing) {
     const byName = new Map<string, string[]>();
-    for (const [id, name] of Object.entries(materialNames)) byName.set(name, [...(byName.get(name) || []), id]);
+    for (const [id, name] of [...Object.entries(materialNames), ...Object.entries(legacyMaterialNames)]) {
+      const ids = byName.get(name) || [];
+      if (!ids.includes(id)) byName.set(name, [...ids, id]);
+    }
     const uniqueNames = [...byName.entries()].filter(([name, ids]) => name.length > 0 && ids.length === 1).sort((a, b) => b[0].length - a[0].length);
     for (const table of doc.querySelectorAll('table')) {
       const headers = Array.from(table.querySelector('thead tr')?.children || []);
@@ -94,20 +97,20 @@ function readableDocument(html: string, materialNames: Record<string, string>, p
 }
 
 // Remount on switching documents or modes, so typing never replaces the selection.
-export default function ProposalDocument({ content, editing, projectId, materialNames, onChange }: Props) {
+export default function ProposalDocument({ content, editing, projectId, materialNames, legacyMaterialNames = {}, onChange }: Props) {
   const [initialContent] = useState(content);
   const [html, setHtml] = useState('');
   const editor = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const rendered = marked.parse(initialContent, { async: false, gfm: true });
-    const clean = readableDocument(DOMPurify.sanitize(rendered), materialNames, projectId, editing);
+    const clean = readableDocument(DOMPurify.sanitize(rendered), materialNames, legacyMaterialNames, projectId, editing);
     if (editing && editor.current) editor.current.innerHTML = clean;
     else setHtml(clean);
-  }, [initialContent, editing, materialNames, projectId]);
+  }, [initialContent, editing, materialNames, legacyMaterialNames, projectId]);
 
   if (!editing) return <div className="proposal-document" aria-label="方案初稿内容" dangerouslySetInnerHTML={{ __html: html }} />;
-  return <div ref={editor} className="proposal-document proposal-document-edit" role="textbox" aria-label="编辑方案初稿" aria-multiline="true" contentEditable suppressContentEditableWarning
+  return <div ref={editor} className="proposal-document proposal-document-edit" role="textbox" aria-label="编辑方案初稿" aria-required="true" aria-multiline="true" contentEditable suppressContentEditableWarning
     onInput={e => onChange(converter.turndown(e.currentTarget.innerHTML))}
     onPaste={e => { e.preventDefault(); document.execCommand('insertText', false, e.clipboardData.getData('text/plain')); }} />;
 }

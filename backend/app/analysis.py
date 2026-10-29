@@ -6,11 +6,28 @@ import httpx
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from .database import SessionLocal
-from .models import (AdditionalCitation, AnalysisTask, ExtractedFact, Material, ModelConsent,
+from .model_settings import model_key, model_settings
+from .membership import member_role
+from .models import (AdditionalCitation, AnalysisTask, ExtractedFact, Material, ModelConsent, QueuedJob,
                      OpenQuestion, Requirement, TaskAttempt, TaskAttemptTiming, TaskConfig, TaskSegment)
 
 class TaskFailure(Exception):
     pass
+
+class TaskCancelled(Exception):
+    pass
+
+def ensure_task_running(db, task_id):
+    locked = db.execute(update(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.status == 'running').values(status='running'))
+    if locked.rowcount != 1:
+        db.rollback()
+        raise TaskCancelled()
+    job = db.scalar(select(QueuedJob).where(QueuedJob.kind == 'requirements', QueuedJob.target_id == task_id, QueuedJob.status == 'running'))
+    if job and not member_role(db, job.project_id, job.user_id):
+        db.execute(update(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.status == 'running')
+                   .values(status='cancelled', error='提交人已失去项目权限，任务已停止。'))
+        db.commit()
+        raise TaskCancelled()
 
 class Citation(BaseModel):
     material_id: str = Field(min_length=1, max_length=100)
@@ -81,17 +98,16 @@ def execute_task(task_id: str):
         try:
             if not db.scalar(select(ModelConsent.id).where(ModelConsent.task_id == task.id)):
                 raise TaskFailure('未确认资料发送和费用，任务未执行。')
-            key = os.environ.get('DEEPSEEK_API_KEY', '').strip()
+            key = model_key()
             if not key:
                 raise TaskFailure('未配置模型密钥。')
-            cap = int(os.environ.get('QISHU_MAX_REQUESTS', '50'))
+            allowed, cap = model_settings(db)
             max_output = int(os.environ.get('QISHU_MAX_OUTPUT_TOKENS', '16384'))
             if not 1 <= max_output <= 393216 or cap < 1:
                 raise TaskFailure('模型调用次数或输出长度配置无效。')
             task_config = db.get(TaskConfig, task.id)
             if not task_config or task_config.prompt_version not in ('requirements_v1', 'requirements_v2', 'requirements_v3', 'requirements_v4', 'requirements_v5', 'requirements_v6'):
                 raise TaskFailure('任务配置不存在，无法继续。')
-            allowed = [x.strip() for x in os.environ.get('DEEPSEEK_ALLOWED_MODELS', 'deepseek-flash').split(',') if x.strip()]
             if task_config.model_name not in allowed:
                 raise TaskFailure('原模型已不在允许列表中，请检查配置。')
             prompt = (Path(__file__).parent / 'prompts' / f'{task_config.prompt_version}.txt').read_text(encoding='utf-8')
@@ -109,12 +125,18 @@ def execute_task(task_id: str):
                 if task_config.prompt_version in ('requirements_v3', 'requirements_v4', 'requirements_v5', 'requirements_v6'):
                     payload['thinking'] = {'type': 'disabled'}
                 for attempt_no in range(3):
+                    ensure_task_running(db, task_id)
+                    allowed, cap = model_settings(db)
+                    if task_config.model_name not in allowed:
+                        raise TaskFailure('原模型已不在允许列表中，请检查配置。')
                     attempts = db.scalar(select(func.count()).select_from(TaskAttempt).where(TaskAttempt.task_id == task.id))
                     if attempts >= cap:
-                        task.status, task.error = 'paused_limit', '已达到任务调用次数上限，已保存进度。'
+                        db.execute(update(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.status == 'running')
+                                   .values(status='paused_limit', error='已达到任务调用次数上限，已保存进度。'))
                         db.commit()
                         return
-                    record = TaskAttempt(task_id=task.id, segment_id=group[0].id)
+                    job = db.scalar(select(QueuedJob).where(QueuedJob.kind == 'requirements', QueuedJob.target_id == task.id, QueuedJob.status == 'running'))
+                    record = TaskAttempt(task_id=task.id, segment_id=group[0].id, model_name=task_config.model_name, actor_id=job.user_id if job else 'local-user')
                     db.add(record)
                     db.commit()
                     try:
@@ -149,6 +171,7 @@ def execute_task(task_id: str):
                                 if matched is None:
                                     raise TaskFailure('模型结果的引用文字不在对应资料中，未保存。')
                                 source.quote = matched
+                        ensure_task_running(db, task_id)
                         for kind, entries, model in [('requirement', result.requirements, Requirement), ('question', result.questions, OpenQuestion), ('fact', result.facts, ExtractedFact)]:
                             for item in entries:
                                 text_column = model.original_text if kind == 'requirement' else model.text
@@ -181,12 +204,17 @@ def execute_task(task_id: str):
                         time.sleep(1)
                 else:
                     raise TaskFailure('模型服务暂时不可用。')
-            task.status, task.error = 'completed', ''
+            finished = db.execute(update(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.status == 'running')
+                                  .values(status='completed', error=''))
+            if finished.rowcount != 1:
+                db.rollback()
+                return
             db.commit()
+        except TaskCancelled:
+            db.rollback()
         except Exception as exc:
             db.rollback()
-            task = db.get(AnalysisTask, task_id)
-            if task:
-                task.status = 'failed'
-                task.error = str(exc) if isinstance(exc, TaskFailure) else '整理未完成，模型输出或服务异常，请重试。'
-                db.commit()
+            error = str(exc) if isinstance(exc, TaskFailure) else '整理未完成，模型输出或服务异常，请重试。'
+            db.execute(update(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.status == 'running')
+                       .values(status='failed', error=error))
+            db.commit()

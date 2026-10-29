@@ -25,6 +25,210 @@ def test_create_project_and_restore_material(client):
     assert response.json()['text'] == '客户希望建立台账。'
     assert client.get(f'/api/v1/projects/{project_id}/materials').json()[0]['text'] == '客户希望建立台账。'
 
+def test_same_name_material_groups_have_stable_distinct_labels_and_versions(client):
+    project = client.post('/api/v1/projects', json={'name':'资料编号测试'}).json()['id']
+    root = f'/api/v1/projects/{project}/materials'
+    def upload(content):
+        response = client.post(root, files={'file':('访谈.txt', content.encode(), 'text/plain')})
+        assert response.status_code == 201
+        return response.json()
+    first = upload('虚构资料一')
+    second = upload('虚构资料二')
+    assert first['display_name'] == '访谈.txt（资料 1）· 第 1 版'
+    assert second['display_name'] == '访谈.txt（资料 2）· 第 1 版'
+    new = client.post(root + '/' + first['id'] + '/versions', files={'file':('访谈.txt', '虚构资料一新版'.encode(), 'text/plain')})
+    assert new.status_code == 201
+    assert new.json()['display_name'] == '访谈.txt（资料 1）· 第 2 版'
+    listed = client.get(root).json()
+    assert [m['display_name'] for m in listed] == [first['display_name'], second['display_name'], new.json()['display_name']]
+
+def test_same_name_sources_remain_distinct_in_generated_input_and_word(client, monkeypatch):
+    import io, json
+    from docx import Document
+    import app.database as database
+    import app.models as models
+    import app.proposal as proposal
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'fake-for-test')
+    monkeypatch.setattr(proposal, 'SessionLocal', database.SessionLocal)
+    monkeypatch.setattr(proposal, 'ProposalDraft', models.ProposalDraft)
+    project = client.post('/api/v1/projects', json={'name':'同名来源测试'}).json()['id']
+    root = f'/api/v1/projects/{project}'
+    first = client.post(root+'/materials',files={'file':('访谈.txt','甲资料原文'.encode(),'text/plain')}).json()
+    second = client.post(root+'/materials',files={'file':('访谈.txt','乙资料原文'.encode(),'text/plain')}).json()
+    entries = [{'id':'a','text':'需求甲','material_id':first['id'],'quote':'甲资料原文','related_sources':[]},
+               {'id':'b','text':'需求乙','material_id':second['id'],'quote':'乙资料原文','related_sources':[]}]
+    with database.SessionLocal() as db:
+        b=models.Baseline(project_id=project,snapshot=json.dumps(entries,ensure_ascii=False));db.add(b);db.commit();bid=b.id
+    class Response:
+        status_code=200
+        def raise_for_status(self): pass
+        def json(self): return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'content':'# 方案\n\n正文'})}}]}
+    monkeypatch.setattr(proposal.httpx,'post',lambda *a,**k:Response())
+    r=client.post(root+'/proposals',json={'baseline_id':bid,'template_id':'demo-v1','confirm_external_use':True})
+    assert r.status_code==202
+    draft=r.json()['id']
+    with database.SessionLocal() as db:
+        payload=json.loads(db.get(models.ProposalDraft,draft).input_snapshot)
+        names=[x['已有资料出处'][0]['资料名称'] for x in payload['已确认需求']]
+        assert names==[first['display_name'],second['display_name']]
+    result=client.post(root+f'/proposals/{draft}/export',json={'version':1,'kind':'draft'})
+    assert result.status_code==200
+    text='\n'.join(p.text for p in Document(io.BytesIO(result.content)).paragraphs)
+    assert first['display_name'] in text and second['display_name'] in text
+
+def test_pdf_preview_is_project_scoped_and_only_accepts_pdf(client):
+    import io
+    from reportlab.pdfgen import canvas
+    buf = io.BytesIO()
+    pdf = canvas.Canvas(buf)
+    pdf.drawString(30, 700, 'Fictional document')
+    pdf.save()
+    project = client.post('/api/v1/projects', json={'name': '虚构 PDF 项目'}).json()['id']
+    other = client.post('/api/v1/projects', json={'name': '另一个项目'}).json()['id']
+    material = client.post(f'/api/v1/projects/{project}/materials', files={'file': ('sample.pdf', buf.getvalue(), 'application/pdf')}).json()['id']
+    response = client.get(f'/api/v1/projects/{project}/materials/{material}/pdf-preview')
+    assert response.status_code == 200 and response.content == buf.getvalue()
+    assert response.headers['content-type'] == 'application/pdf'
+    assert response.headers['content-disposition'] == 'inline'
+    assert client.get(f'/api/v1/projects/{other}/materials/{material}/pdf-preview').status_code == 404
+    text = client.post(f'/api/v1/projects/{project}/materials', files={'file': ('a.txt', b'sample', 'text/plain')}).json()['id']
+    assert client.get(f'/api/v1/projects/{project}/materials/{text}/pdf-preview').status_code == 404
+
+def test_removed_word_structure_check_is_unavailable(client):
+    project, _, _, draft = make_review_fixture(client)
+    path = f'/api/v1/projects/{project}/proposals/{draft}/document-check'
+    assert client.post(path, json={'version': 1, 'kind': 'draft'}).status_code == 404
+
+def test_word_preview_is_versioned_and_requires_approval_for_approved_copy(client, monkeypatch):
+    import app.main as main
+    import app.database as database
+    import app.models as models
+    from sqlalchemy import select
+    project, other, _, draft = make_review_fixture(client)
+    path = f'/api/v1/projects/{project}/proposals/{draft}/document-preview'
+    monkeypatch.setattr(main, 'render_word_pdf', lambda content: b'%PDF-1.4\nmock preview')
+    result = client.post(path, json={'version': 1, 'kind': 'draft'})
+    assert result.status_code == 200 and result.content.startswith(b'%PDF-')
+    assert result.headers['cache-control'] == 'private, no-store'
+    assert client.post(path, json={'version': 999, 'kind': 'draft'}).status_code == 409
+    assert client.post(path, json={'version': 1, 'kind': 'approved'}).status_code == 409
+    assert client.post(f'/api/v1/projects/{other}/proposals/{draft}/document-preview', json={'version': 1, 'kind': 'draft'}).status_code == 404
+    with database.SessionLocal() as db:
+        assert list(db.scalars(select(models.ProposalExportEvent))) == []
+    def fail(_):
+        raise main.DocumentRenderError('预览不可用')
+    monkeypatch.setattr(main, 'render_word_pdf', fail)
+    result = client.post(path, json={'version': 1, 'kind': 'draft'})
+    assert result.status_code == 503 and result.json()['error']['code'] == 'DOCUMENT_PREVIEW_FAILED'
+
+def test_approved_word_marks_original_metadata_as_historical_without_changing_body():
+    import io
+    from docx import Document
+    from app.proposal_docx import build_docx
+    content = '# 方案\n\n## 文档信息\n\n- 文档状态：草稿\n- 编写与审核职责：负责人待确认，当前尚未审核。\n\n## 业务现状\n\n原资料尚未审核，需继续核实。'
+    def paragraphs(kind):
+        output = build_docx(content, kind, 2, [], {}, [], '1 条需求')
+        return [p.text for p in Document(io.BytesIO(output)).paragraphs]
+    approved = paragraphs('approved')
+    draft = paragraphs('draft')
+    assert any('原稿生成时记录（当前状态以文首为准）：文档状态：草稿' in p for p in approved)
+    assert any('原稿生成时记录（当前状态以文首为准）：编写与审核职责：负责人待确认，当前尚未审核。' in p for p in approved)
+    assert '原资料尚未审核，需继续核实。' in approved
+    assert '文档状态：草稿' in draft
+    assert not any('原稿生成时记录' in p for p in draft)
+
+def test_generated_source_scope_only_qualifies_known_overstatement():
+    from app.proposal import qualify_generated_source_scope
+    value = '本次提供的资料未涉及具体数字。\n客户资料包含一条需求。'
+    assert qualify_generated_source_scope(value) == '本次提供的需求清单和摘录未涉及具体数字。\n客户资料包含一条需求。'
+    assert qualify_generated_source_scope('资料版本未涉及具体字段') == '资料版本未涉及具体字段'
+    assert qualify_generated_source_scope('本次资料未涉及接口。原文：“本次资料未涉及接口”。') == '本次提供的需求清单和摘录未涉及接口。原文：“本次资料未涉及接口”。'
+    assert qualify_generated_source_scope('资料未涉及接口；该材料未明确规则。') == '本次提供的需求清单和摘录未涉及接口；本次提供的需求清单和摘录未明确规则。'
+
+def test_project_todo_counts_pending_requirements_and_review_state(client):
+    import app.database as database
+    import app.models as models
+    from sqlalchemy import select
+    project, other, material, draft = make_review_fixture(client)
+    path = f'/api/v1/projects/{project}/todo'
+    assert client.get(path).json() == {'pending_requirements':0, 'pending_reviews':0, 'needs_review':0, 'unknown_reviews':0}
+    with database.SessionLocal() as db:
+        req = db.scalar(select(models.Requirement).where(models.Requirement.project_id == project))
+        req.status = 'pending'; db.commit()
+    assert client.get(path).json()['pending_requirements'] == 1
+    with database.SessionLocal() as db:
+        req = db.scalar(select(models.Requirement).where(models.Requirement.project_id == project))
+        req.status = 'confirmed'; db.commit()
+    assert client.post(f'/api/v1/projects/{project}/proposals/{draft}/review', json={'version':1,'action':'submit'}).status_code == 200
+    assert client.get(path).json()['pending_reviews'] == 1
+    with database.SessionLocal() as db:
+        row = db.get(models.Material, material); row.text += '内容变化'; db.commit()
+    todo = client.get(path).json()
+    assert todo['pending_reviews'] == 0 and todo['needs_review'] == 1
+    assert client.get(f'/api/v1/projects/{other}/todo').json()['pending_reviews'] == 0
+    assert client.get('/api/v1/projects/not-a-project/todo').status_code == 404
+
+def test_proposal_rejects_contradictory_scope_before_saving(client, monkeypatch):
+    import json
+    import app.database as database
+    import app.models as models
+    import app.proposal as proposal
+    monkeypatch.setattr(proposal, 'SessionLocal', database.SessionLocal)
+    monkeypatch.setattr(proposal, 'ProposalDraft', models.ProposalDraft)
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'fake-for-test')
+    project, _, _, old_draft = make_review_fixture(client)
+    with database.SessionLocal() as db:
+        baseline = db.get(models.ProposalDraft, old_draft).baseline_id
+    class FakeResponse:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'content':'未在本期的功能：移动端，资料未涉及。'},ensure_ascii=False)}}]}
+    monkeypatch.setattr(proposal.httpx, 'post', lambda *a, **kw: FakeResponse())
+    response = client.post(f'/api/v1/projects/{project}/proposals', json={'baseline_id':baseline,'template_id':'demo-v1','confirm_external_use':True})
+    assert response.status_code == 202
+    draft = next(x for x in client.get(f'/api/v1/projects/{project}/proposals').json() if x['id'] == response.json()['id'])
+    assert draft['status'] == 'failed' and not draft['content']
+    assert '资料未提及' in draft['error']
+
+def test_resume_with_another_allowed_model_retains_attempt_count_and_history(client, monkeypatch):
+    import json
+    import app.analysis as analysis
+    import app.database as database
+    from app.models import TaskAttempt, TaskModelChange
+    from sqlalchemy import select
+    monkeypatch.setattr(analysis, 'SessionLocal', database.SessionLocal)
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'fake-for-test')
+    monkeypatch.setenv('DEEPSEEK_ALLOWED_MODELS', 'deepseek-flash,deepseek-chat')
+    monkeypatch.setenv('QISHU_MAX_REQUESTS', '1')
+    project = client.post('/api/v1/projects', json={'name':'虚构换型测试'}).json()['id']
+    material = client.post(f'/api/v1/projects/{project}/materials', files={'file':('source.txt', ('甲'*11999+'\n'+'乙'*1000).encode(), 'text/plain')}).json()['id']
+    seen = []
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            quote = '甲' if len(seen)==1 else '乙'
+            result = {'requirements':[{'text':'需求'+quote,'material_id':material,'quote':quote}]}
+            return {'usage':{'prompt_tokens':10,'completion_tokens':20},'choices':[{'message':{'content':json.dumps(result,ensure_ascii=False)}}]}
+    def fake_post(_url, **kwargs):
+        seen.append(kwargs['json']['model'])
+        return Response()
+    monkeypatch.setattr(analysis.httpx, 'post', fake_post)
+    task = client.post(f'/api/v1/projects/{project}/requirement-tasks', json={'material_ids':[material],'confirm_external_use':True}).json()
+    path = f'/api/v1/projects/{project}/requirement-tasks/{task["id"]}'
+    assert client.get(path).json()['status']=='paused_limit'
+    monkeypatch.setenv('QISHU_MAX_REQUESTS', '2')
+    assert client.post(path+'/resume', json={'confirm_external_use':True,'model_name':'deepseek-chat'}).status_code==200
+    result = client.get(path).json()
+    assert result['status']=='completed' and result['calls']==2 and result['estimated_cost_usd'] is None
+    assert seen==['deepseek-flash','deepseek-chat']
+    with database.SessionLocal() as db:
+        attempts = list(db.scalars(select(TaskAttempt).where(TaskAttempt.task_id==task['id']).order_by(TaskAttempt.created_at)))
+        change = db.scalar(select(TaskModelChange).where(TaskModelChange.task_id==task['id']))
+        assert [a.model_name for a in attempts]==seen
+        assert (change.previous_model,change.new_model)==tuple(seen)
+
 def test_reject_invalid_inputs_and_missing_project(client):
     assert client.post('/api/v1/projects', json={'name': '  '}).status_code == 422
     missing = client.post('/api/v1/projects/missing/materials', files={'file': ('a.txt', b'abc', 'text/plain')})
@@ -493,7 +697,7 @@ def make_review_fixture(client):
         db.add(draft);db.commit(); draft_id=draft.id
     return project, other, material['id'], draft_id
 
-def test_review_export_gates_and_version_restore(client):
+def test_review_export_gates_and_version_restore(client, monkeypatch):
     import io
     import zipfile
     from docx import Document
@@ -532,11 +736,18 @@ def test_review_export_gates_and_version_restore(client):
     assert approved.status_code==200
     approved_text='\n'.join(p.text for p in Document(io.BytesIO(approved.content)).paragraphs)
     assert '已审核方案（本机试用）' in approved_text and '一般事项批准保留（未解决）' in approved_text and '方案新增的接口问题' in approved_text
+    rendered = []
+    monkeypatch.setattr(main, 'render_word_pdf', lambda data: rendered.append(data) or b'%PDF-1.4\npreview')
+    preview = client.post(base+'/document-preview',json={'version':1,'kind':'approved'})
+    assert preview.status_code == 200 and preview.content.startswith(b'%PDF-')
+    preview_text = '\n'.join(p.text for p in Document(io.BytesIO(rendered[0])).paragraphs)
+    assert '审核状态：已审核（本机试用）' in preview_text and '一般事项批准保留（未解决）' in preview_text
     with database.SessionLocal() as db:
         assert len(list(db.scalars(select(models.ProposalExportEvent)))) == 2
         source=db.get(models.Material,material); original=source.text; source.text += '资料发生变化。'; db.commit()
     assert client.get(base+'/review').json()['status']=='needs_review'
     assert client.post(base+'/export',json={'version':1,'kind':'approved'}).status_code==409
+    assert client.post(base+'/document-preview',json={'version':1,'kind':'approved'}).status_code==409
     with database.SessionLocal() as db:
         source=db.get(models.Material,material); source.text=original; db.commit()
     current=client.get(f'/api/v1/projects/{project}/requirements').json()[0]
@@ -640,7 +851,7 @@ def test_reviewed_fact_snapshot_is_used_with_sources_and_revocation_blocks_appro
     r=client.post(f'/api/v1/projects/{project}/proposals',json={'baseline_id':baseline_id,'template_id':'demo-v1','confirm_external_use':True})
     assert r.status_code == 202
     draft_id=r.json()['id']
-    assert sent[0]['项目和需求']['已核对资料事实'] == [{'事实内容':'五个科室使用Excel','已有资料出处':[{'资料名称':'访谈.txt'}]}]
+    assert sent[0]['项目和需求']['已核对资料事实'] == [{'事实内容':'五个科室使用Excel','已有资料出处':[{'资料名称':'访谈.txt（资料 1）· 第 1 版'}]}]
     assert '未核对的事实' not in json.dumps(sent[0],ensure_ascii=False)
     assert a_id not in json.dumps(sent[0],ensure_ascii=False)
     submit=client.post(f'/api/v1/projects/{project}/proposals/{draft_id}/review',json={'version':1,'action':'submit'})
@@ -648,3 +859,433 @@ def test_reviewed_fact_snapshot_is_used_with_sources_and_revocation_blocks_appro
     new_id=client.post(f'/api/v1/projects/{project}/baselines').json()['id']
     new=next(x for x in client.get(f'/api/v1/projects/{project}/baselines').json() if x['id']==new_id)
     assert [f['id'] for f in new['facts']] == [b_id]
+
+
+def test_section_candidate_accept_is_bounded_and_conflicts_preserve_it(client, monkeypatch):
+    import json
+    import app.database as database
+    import app.models as models
+    import app.section_edit as editing
+    from sqlalchemy import select
+    monkeypatch.setattr(editing, 'SessionLocal', database.SessionLocal)
+    monkeypatch.setattr(editing, 'SectionEdit', models.SectionEdit)
+    monkeypatch.setattr(editing, 'QueuedJob', models.QueuedJob)
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'fake-for-test')
+    project, other, _, draft_id = make_review_fixture(client)
+    with database.SessionLocal() as db:
+        draft=db.get(models.ProposalDraft,draft_id)
+        draft.content='# 方案\n\n## 甲\n原始内容\n\n### 甲子节\n子节\n\n## 乙\n不可更改\n'
+        original=draft.content; db.commit()
+    url=f'/api/v1/projects/{project}/proposals/{draft_id}'
+    target=client.get(url+'/sections').json()['sections'][1]
+    body={'version':1,'section_id':target['id'],'instruction':'使内容清晰','confirm_external_use':False}
+    calls=[]
+    output={'content':'新的内容\n\n### 甲子节\n修改后的子节','suggestions':['请核对其他章节']}
+    class Response:
+        status_code=200
+        def raise_for_status(self): pass
+        def json(self): return {'usage':{'prompt_tokens':15,'completion_tokens':8},'choices':[{'message':{'content':json.dumps(output,ensure_ascii=False)}}]}
+    monkeypatch.setattr(editing.httpx,'post',lambda *a,**kw: (calls.append(1) or Response()))
+    assert client.post(url+'/section-edits',json=body).status_code==400 and not calls
+    body['confirm_external_use']=True
+    assert client.post(f'/api/v1/projects/{other}/proposals/{draft_id}/section-edits',json=body).status_code==404
+    task=client.post(url+'/section-edits',json=body).json()
+    candidate=client.get(url+'/section-edits').json()[0]
+    assert candidate['status']=='completed' and candidate['calls']==1 and candidate['suggestions']
+    assert client.post(f'/api/v1/projects/{other}/section-edits/{task["id"]}/accept',json={'version':1}).status_code==404
+    accepted=client.post(f'/api/v1/projects/{project}/section-edits/{task["id"]}/accept',json={'version':1})
+    assert accepted.status_code==200 and accepted.json()['version']==2
+    assert accepted.json()['content'].startswith('# 方案\n\n## 甲\n')
+    assert accepted.json()['content'].endswith('## 乙\n不可更改\n')
+    with database.SessionLocal() as db:
+        assert db.scalar(select(models.ProposalRevision).where(models.ProposalRevision.draft_id==draft_id)).content==original
+    decision=client.get(url+'/section-edits').json()[0]
+    assert decision['decision_actor_id']=='local-user' and decision['decided_at']
+    assert client.post(f'/api/v1/projects/{project}/section-edits/{task["id"]}/accept',json={'version':1}).status_code==409
+    target=client.get(url+'/sections').json()['sections'][1]
+    task=client.post(url+'/section-edits',json={**body,'version':2,'section_id':target['id']}).json()
+    content=accepted.json()['content']+'人工变更'
+    assert client.patch(url,json={'version':2,'content':content}).status_code==200
+    assert client.post(f'/api/v1/projects/{project}/section-edits/{task["id"]}/accept',json={'version':2}).status_code==409
+    saved=next(x for x in client.get(url+'/section-edits').json() if x['id']==task['id'])
+    assert saved['candidate']==output['content'] and saved['status']=='completed'
+    target=client.get(url+'/sections').json()['sections'][1]
+    output['content']='正文\n## 越界标题\n不应保存'
+    failed=client.post(url+'/section-edits',json={**body,'version':3,'section_id':target['id']}).json()
+    assert next(x for x in client.get(url+'/section-edits').json() if x['id']==failed['id'])['status']=='failed'
+
+
+def test_section_parser_fences_and_duplicate_headings():
+    from app.section_edit import sections, valid_candidate
+    doc='# 顶层\n\n## 重名\n正文\n```text\n## 示例标题\n```\n\n## 重名\n其他\n'
+    rows=sections(doc)
+    assert [r['title'] for r in rows]==['顶层','重名','重名']
+    assert rows[1]['id']!=rows[2]['id']
+    assert doc[rows[1]['start']:rows[1]['end']].endswith('```\n\n')
+    assert not sections('# 标题\n```\n未闭合')
+    assert not valid_candidate('段落\n## 越界',2)
+    assert not valid_candidate('```\n内容',2)
+    assert not valid_candidate('对接方式尚待确认，在确认前不纳入建设目标。',2)
+    assert valid_candidate('段落\n### 子章节\n内容',2)
+
+
+def test_consistency_check_quote_validation_decisions_and_stale_version(client,monkeypatch):
+    import json
+    import app.database as database
+    import app.models as models
+    import app.consistency as consistency
+    for name in ('ConsistencyCheck','ConsistencyIssue','QueuedJob'):
+        monkeypatch.setattr(consistency,name,getattr(models,name))
+    monkeypatch.setattr(consistency,'SessionLocal',database.SessionLocal)
+    monkeypatch.setenv('DEEPSEEK_API_KEY','fake-for-test')
+    monkeypatch.setenv('DEEPSEEK_ALLOWED_MODELS','deepseek-custom,deepseek-flash')
+    project,other,_,draft_id=make_review_fixture(client)
+    content='# 项目\n\n## 目标\n建设甲平台。\n\n## 范围\n建设乙平台。\n'
+    with database.SessionLocal() as db:
+        row=db.get(models.ProposalDraft,draft_id);row.content=content
+        row.input_snapshot=json.dumps({'已确认需求':[{'需求内容':'需要支持设备报修。'}],'未解决问题':[{'问题':'是否对接办公系统尚未确认。'}]},ensure_ascii=False);db.commit()
+    root=f'/api/v1/projects/{project}/proposals/{draft_id}'
+    calls=[]
+    issues=[{'category':'名称','description':'平台名称不一致，请核对。','location_quote':'建设甲平台。','evidence_quote':'建设乙平台。'},
+        {'category':'需求覆盖','description':'方案未提到设备报修，请核对。','location_quote':'','evidence_quote':'需要支持设备报修。'}]
+    class Response:
+        status_code=200
+        def raise_for_status(self):pass
+        def json(self):return {'usage':{'prompt_tokens':25,'completion_tokens':18},'choices':[{'message':{'content':json.dumps({'issues':issues},ensure_ascii=False)}}]}
+    monkeypatch.setattr(consistency.httpx,'post',lambda *a,**kw:(calls.append(kw) or Response()))
+    assert client.post(root+'/consistency-checks',json={'version':1}).status_code==400 and not calls
+    assert client.post(f'/api/v1/projects/{other}/proposals/{draft_id}/consistency-checks',json={'version':1,'confirm_external_use':True}).status_code==404
+    created=client.post(root+'/consistency-checks',json={'version':1,'confirm_external_use':True})
+    assert created.status_code==202
+    check=client.get(root+'/consistency-checks').json()[0]
+    assert check['status']=='completed' and len(check['issues'])==2 and check['calls']==1 and not check['stale']
+    assert check['model_name']=='deepseek-custom' and calls[0]['json']['model']=='deepseek-custom'
+    name_issue=next(i for i in check['issues'] if i['category']=='名称')
+    assert name_issue['location_chapter']=='目标' and name_issue['location_line']==4 and name_issue['evidence_kind']=='方案正文'
+    issue=check['issues'][0];url=f'/api/v1/projects/{project}/consistency-checks/{check["id"]}/issues/{issue["id"]}'
+    assert client.patch(url,json={'check_version':1,'issue_version':1,'status':'resolved','note':''}).status_code==422
+    assert client.patch(url,json={'check_version':1,'issue_version':1,'status':'resolved','note':'人工核对处理'}).status_code==200
+    assert client.patch(url,json={'check_version':1,'issue_version':1,'status':'dismissed','note':'旧状态'}).status_code==409
+    assert client.get(root+'/review').json()['status']=='draft'
+    assert client.patch(root,json={'version':1,'content':content+'人工修改'}).status_code==200
+    old=client.get(root+'/consistency-checks').json()[0];assert old['stale'] and len(old['issues'])==2
+    assert client.patch(url,json={'check_version':1,'issue_version':2,'status':'dismissed','note':'不能覆盖'}).status_code==409
+    issues[0]['evidence_quote']='并不存在的材料原句'
+    created=client.post(root+'/consistency-checks',json={'version':2,'confirm_external_use':True});assert created.status_code==202
+    failed=next(x for x in client.get(root+'/consistency-checks').json() if x['id']==created.json()['id'])
+    assert failed['status']=='failed' and not failed['issues'] and '无法定位' in failed['error']
+
+
+def test_consistency_rejects_uncited_and_invalid_results():
+    import json
+    import pytest
+    from app.consistency import Findings,CheckFailure,validate_findings
+    inputs=json.dumps({'需求':['需要设备报修']},ensure_ascii=False)
+    values={'issues':[{'category':'需求覆盖','description':'疑似遗漏','location_quote':'','evidence_quote':'需要设备报修'}]}
+    validate_findings(Findings.model_validate(values),'方案正文',inputs)
+    values['issues'][0]['location_quote']='并非正文'
+    with pytest.raises(CheckFailure):validate_findings(Findings.model_validate(values),'方案正文',inputs)
+
+
+def test_outline_versions_coverage_and_generation_bindings(client,monkeypatch):
+    import json
+    import app.database as database
+    import app.models as models
+    import app.proposal as proposal
+    monkeypatch.setattr(proposal,'SessionLocal',database.SessionLocal)
+    monkeypatch.setattr(proposal,'ProposalDraft',models.ProposalDraft)
+    monkeypatch.setattr(proposal,'QueuedJob',models.QueuedJob)
+    monkeypatch.setenv('DEEPSEEK_API_KEY','fake-for-test')
+    project,other,_,old_draft=make_review_fixture(client)
+    with database.SessionLocal() as db:
+        baseline_id=db.get(models.ProposalDraft,old_draft).baseline_id
+        baseline=json.loads(db.get(models.Baseline,baseline_id).snapshot)
+    rid=baseline[0]['id'];path=f'/api/v1/projects/{project}/outlines'
+    assert client.get(path,params={'baseline_id':baseline_id}).status_code==200
+    assert len(client.get(path,params={'baseline_id':baseline_id}).json()['defaults'])==9
+    assert client.get(f'/api/v1/projects/{other}/outlines',params={'baseline_id':baseline_id}).status_code==404
+    chapters=[{'id':'one','title':'建设目标','instruction':'写清目标','requirement_ids':[rid]},
+              {'id':'two','title':'建设范围','instruction':'强调待确认','requirement_ids':[]}]
+    body={'baseline_id':baseline_id,'template_id':'demo-v1','chapters':chapters}
+    bad={**body,'chapters':[dict(chapters[0],requirement_ids=['other-project-id'])]}
+    assert client.post(path,json=bad).status_code==422
+    assert client.post(path,json={**body,'chapters':[]}).status_code==422
+    assert client.post(path,json={**body,'chapters':[chapters[0],dict(chapters[1],title='建设目标')]}).status_code==422
+    first=client.post(path,json=body);assert first.status_code==201
+    version1=first.json();assert version1['version']==1 and not version1['uncovered']
+    second=client.post(path,json={**body,'chapters':[dict(chapters[1],requirement_ids=[])]});assert second.status_code==201
+    assert second.json()['version']==2 and second.json()['uncovered'][0]['id']==rid
+    old=next(o for o in client.get(path,params={'baseline_id':baseline_id}).json()['outlines'] if o['id']==version1['id'])
+    assert old['chapters']==chapters
+    fake={'content':'# 虚构方案\n\n## 建设目标\n目标内容。\n\n## 建设范围\n范围待确认。'}
+    calls=[]
+    class Response:
+        status_code=200
+        def raise_for_status(self):pass
+        def json(self):return {'usage':{'prompt_tokens':20,'completion_tokens':30},'choices':[{'message':{'content':json.dumps(fake,ensure_ascii=False)}}]}
+    monkeypatch.setattr(proposal.httpx,'post',lambda *a,**kw:(calls.append(kw) or Response()))
+    url=f'/api/v1/projects/{project}/proposals'
+    invalid=client.post(url,json={'baseline_id':baseline_id,'template_id':'demo-v1','outline_id':'missing','confirm_external_use':True})
+    assert invalid.status_code==404 and not calls
+    created=client.post(url,json={'baseline_id':baseline_id,'template_id':'demo-v1','outline_id':version1['id'],'confirm_external_use':True})
+    assert created.status_code==202
+    draft=next(x for x in client.get(url).json() if x['id']==created.json()['id'])
+    assert draft['status']=='completed' and draft['calls']==1
+    sent=json.loads(calls[0]['json']['messages'][1]['content'])['项目和需求']['方案提纲']
+    assert [x['章节标题'] for x in sent]==['建设目标','建设范围']
+    assert sent[0]['计划响应需求']==[baseline[0]['text']]
+    link=client.get(f'{url}/{draft["id"]}/outline').json()['outline']
+    assert link['version']==1 and link['chapters']==chapters and link['requirement_texts'][rid]==baseline[0]['text']
+    fake['content']='# 方案\n\n## 建设范围\n顺序错误。\n\n## 建设目标\n顺序错误。'
+    failed=client.post(url,json={'baseline_id':baseline_id,'template_id':'demo-v1','outline_id':version1['id'],'confirm_external_use':True}).json()
+    status=next(x for x in client.get(url).json() if x['id']==failed['id'])
+    assert status['status']=='failed' and '章节标题或顺序' in status['error']
+    assert client.get(f'{url}/{old_draft}/outline').json()['outline'] is None
+
+
+def test_outline_heading_validation_respects_order_and_fences():
+    from app.outline import matches_outline
+    plan=[{'章节标题':'目标'},{'章节标题':'范围'}]
+    assert matches_outline('# 方案\n\n## 目标\n### 背景\n文字\n\n## 范围\n文字',plan)
+    assert not matches_outline('# 方案\n\n## 范围\n\n## 目标',plan)
+    assert not matches_outline('# 方案\n\n## 目标\n\n## 额外\n\n## 范围',plan)
+    assert not matches_outline('```\n## 目标\n```\n## 范围',plan)
+
+def test_material_versions_withdrawal_and_duplicate(client):
+    project = client.post('/api/v1/projects', json={'name': '虚构版本项目'}).json()['id']
+    other = client.post('/api/v1/projects', json={'name': '另一个项目'}).json()['id']
+    url = f'/api/v1/projects/{project}/materials'
+    first = client.post(url, files={'file': ('a.txt', b'original text', 'text/plain')}).json()
+    duplicate = client.post(url, files={'file': ('b.txt', b'original text', 'text/plain')})
+    assert duplicate.status_code == 409 and duplicate.json()['error']['code'] == 'DUPLICATE_MATERIAL'
+    version = client.post(f'{url}/{first["id"]}/versions', files={'file': ('a.txt', b'updated text', 'text/plain')})
+    assert version.status_code == 201 and version.json()['version'] == 2
+    assert version.json()['group_id'] == first['group_id']
+    versions = client.get(f'{url}/{first["id"]}/versions').json()
+    assert [v['version'] for v in versions] == [2, 1]
+    assert client.get(f'/api/v1/projects/{other}/materials/{first["id"]}/versions').status_code == 404
+    assert client.get(f'{url}/{first["id"]}/impact').status_code == 200
+    state_url = f'{url}/{first["id"]}/withdraw'
+    assert client.post(state_url, json={'state_version': 0, 'confirm': False}).status_code == 400
+    assert client.post(state_url, json={'state_version': 0, 'confirm': True}).json()['state'] == 'withdrawn'
+    assert client.post(state_url, json={'state_version': 0, 'confirm': True}).status_code == 409
+    assert client.post(f'{url}/{first["id"]}/restore', json={'state_version': 1, 'confirm': True}).json()['state_version'] == 2
+    assert client.get(f'{url}/{first["id"]}/original').content == b'original text'
+
+def test_manual_requirement_and_revision_keep_baseline(client):
+    project = client.post('/api/v1/projects', json={'name':'虚构需求修订'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    row=client.post(f'{base}/requirements/manual',json={'text':'人工需求原文'}).json()
+    assert row['origin']=='manual' and row['status']=='pending' and not row['material_id']
+    assert client.post(f'{base}/baselines',json={}).status_code==422
+    row=client.patch(f'{base}/requirements/{row["id"]}',json={'status':'confirmed','text':row['text'],'version':row['version']}).json()
+    old=client.post(f'{base}/baselines',json={}).json()['id']
+    suggestion=client.post(f'{base}/requirements/{row["id"]}/revisions',json={'text':'人工需求修订','version':row['version']}).json()
+    assert client.get(f'{base}/requirements').json()[0]['text']=='人工需求原文'
+    response=client.post(f'{base}/requirement-revisions/{suggestion["id"]}/decision',json={'decision':'accept'})
+    assert response.status_code==200 and response.json()['status']=='accepted'
+    assert client.post(f'{base}/requirement-revisions/{suggestion["id"]}/decision',json={'decision':'accept'}).status_code==409
+    requirements=client.get(f'{base}/requirements').json()
+    assert requirements[0]['text']=='人工需求修订' and requirements[0]['status']=='confirmed'
+    old_baseline=next(b for b in client.get(f'{base}/baselines').json() if b['id']==old)
+    assert old_baseline['requirements'][0]['text']=='人工需求原文'
+    assert len(client.get(f'{base}/requirements/{row["id"]}/history').json())==2
+
+
+def test_revision_conflict_keeps_suggestion(client):
+    project = client.post('/api/v1/projects', json={'name':'虚构冲突'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    row=client.post(f'{base}/requirements/manual',json={'text':'原需求'}).json()
+    row=client.patch(f'{base}/requirements/{row["id"]}',json={'status':'confirmed','text':row['text'],'version':row['version']}).json()
+    suggestion=client.post(f'{base}/requirements/{row["id"]}/revisions',json={'text':'建议','version':row['version']}).json()
+    changed=client.patch(f'{base}/requirements/{row["id"]}',json={'status':'confirmed','text':'其他人修改','version':row['version']})
+    assert changed.status_code==200
+    response=client.post(f'{base}/requirement-revisions/{suggestion["id"]}/decision',json={'decision':'accept'})
+    assert response.status_code==409
+    assert client.get(f'{base}/requirements/{row["id"]}/revisions').json()[0]['status']=='pending'
+    assert client.get(f'{base}/requirements').json()[0]['text']=='其他人修改'
+
+def test_withdraw_restore_invalidates_previous_approval(client, monkeypatch):
+    project, _, material, draft = make_review_fixture(client)
+    base=f'/api/v1/projects/{project}/proposals/{draft}'
+    source=f'/api/v1/projects/{project}/materials/{material}'
+    assert client.post(base+'/review',json={'version':1,'action':'submit'}).status_code==200
+    approval={'version':1,'action':'approve','note':'已核对','other_critical_checked':True,'decisions':[{'question_id':'问题一','classification':'critical','disposition':'resolved','reason':'已处理'}]}
+    assert client.post(base+'/review',json=approval).status_code==200
+    impact=client.get(source+'/impact').json()
+    assert impact['baselines']==1 and impact['proposals']==1
+    assert client.post(source+'/withdraw',json={'state_version':0,'confirm':True}).status_code==200
+    assert client.get(base+'/review').json()['status']=='needs_review'
+    assert client.post(base+'/export',json={'version':1,'kind':'approved'}).status_code==409
+    monkeypatch.setenv('DEEPSEEK_API_KEY','fake-for-test')
+    section_id=client.get(base+'/sections').json()['sections'][-1]['id']
+    section=client.post(base+'/section-edits',json={'version':1,'section_id':section_id,'instruction':'改写','confirm_external_use':True})
+    assert section.status_code==409 and section.json()['error']['code']=='MATERIAL_WITHDRAWN'
+    assert client.post(source+'/restore',json={'state_version':1,'confirm':True}).status_code==200
+    assert client.get(base+'/review').json()['status']=='needs_review'
+    assert client.post(base+'/export',json={'version':1,'kind':'approved'}).status_code==409
+
+def test_manual_only_baseline_is_reviewable_without_fake_source(client):
+    import json
+    import app.database as database
+    import app.models as models
+    import app.main as main
+    project = client.post('/api/v1/projects',json={'name':'人工需求项目'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    row=client.post(base+'/requirements/manual',json={'text':'人工确认业务需求'}).json()
+    client.patch(base+'/requirements/'+row['id'],json={'status':'confirmed','text':row['text'],'version':1})
+    baseline=client.post(base+'/baselines',json={}).json()['id']
+    with database.SessionLocal() as db:
+        draft=models.ProposalDraft(project_id=project,baseline_id=baseline,template_id='demo-v1',template_snapshot=main.TEMPLATE_PATH.read_text(encoding='utf-8'),input_snapshot=json.dumps({'已确认需求':[{'需求内容':row['text'],'来源类型':'人工输入并经负责人确认'}]},ensure_ascii=False),model_name='deepseek-flash',status='completed',content='# 方案\n\n## 需求\n\n人工确认业务需求。',calls=0)
+        db.add(draft);db.commit();draft_id=draft.id
+    url=base+'/proposals/'+draft_id
+    assert client.post(url+'/review',json={'version':1,'action':'submit'}).status_code==200
+    result=client.post(url+'/review',json={'version':1,'action':'approve','note':'已核对','other_critical_checked':True,'decisions':[]})
+    assert result.status_code==200 and result.json()['status']=='approved'
+    assert client.post(url+'/export',json={'version':1,'kind':'approved'}).status_code==200
+
+def test_withdrawal_is_blocked_while_project_task_is_running(client):
+    import json
+    import app.database as database
+    import app.models as models
+    project=client.post('/api/v1/projects',json={'name':'虚构任务'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    material=client.post(base+'/materials',files={'file':('a.txt',b'example','text/plain')}).json()
+    with database.SessionLocal() as db:
+        task=models.AnalysisTask(project_id=project,material_ids=json.dumps([material['id']]),status='running')
+        db.add(task);db.commit();task_id=task.id
+    blocked=client.post(base+'/materials/'+material['id']+'/withdraw',json={'state_version':0,'confirm':True})
+    assert blocked.status_code==409 and blocked.json()['error']['code']=='ACTIVE_TASKS'
+    with database.SessionLocal() as db:
+        task=db.get(models.AnalysisTask,task_id);task.status='completed';db.commit()
+    assert client.post(base+'/materials/'+material['id']+'/withdraw',json={'state_version':0,'confirm':True}).status_code==200
+
+def test_citation_location_uses_document_markers_without_guessing(client):
+    import io
+    from docx import Document
+    import app.database as database
+    import app.main as main
+    project=client.post('/api/v1/projects',json={'name':'虚构文档定位'}).json()['id']
+    doc=Document();doc.add_paragraph('前言');doc.add_paragraph('维修人员查看待办工单。')
+    stream=io.BytesIO();doc.save(stream)
+    material=client.post(f'/api/v1/projects/{project}/materials',files={'file':('调研.docx',stream.getvalue(),'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}).json()
+    assert '第2段' in material['text'] and '[第2段]' in material['coverage']['locations']
+    with database.SessionLocal() as db:
+        assert main.citation_location(db,project,material['id'],'维修人员查看待办工单。')=='第2段'
+        assert main.citation_location(db,project,material['id'],'不存在的引用')==''
+
+def test_manual_requirement_optional_source_is_validated(client):
+    project=client.post('/api/v1/projects',json={'name':'虚构来源项目'}).json()['id']
+    other=client.post('/api/v1/projects',json={'name':'其他项目'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    source=client.post(base+'/materials',files={'file':('a.txt','应支持记录报修。'.encode(),'text/plain')}).json()['id']
+    endpoint=base+'/requirements/manual'
+    assert client.post(endpoint,json={'text':'新需求','material_id':source,'quote':'未提供的内容'}).json()['error']['code']=='INVALID_QUOTE'
+    assert client.post(endpoint,json={'text':'新需求','material_id':source}).status_code==422
+    assert client.post(f'/api/v1/projects/{other}/requirements/manual',json={'text':'新需求','material_id':source,'quote':'应支持记录报修。'}).status_code==404
+    result=client.post(endpoint,json={'text':'新需求','material_id':source,'quote':'应支持记录报修。'})
+    assert result.status_code==201 and result.json()['origin']=='manual' and result.json()['material_id']==source
+    assert client.post(base+'/materials/'+source+'/withdraw',json={'state_version':0,'confirm':True}).status_code==200
+    assert client.post(endpoint,json={'text':'新需求','material_id':source,'quote':'应支持记录报修。'}).status_code==409
+
+def test_withdrawn_source_blocks_accepting_revision(client):
+    project=client.post('/api/v1/projects',json={'name':'来源撤回'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    source=client.post(base+'/materials',files={'file':('a.txt','资料原文'.encode(),'text/plain')}).json()['id']
+    row=client.post(base+'/requirements/manual',json={'text':'原需求','material_id':source,'quote':'资料原文'}).json()
+    row=client.patch(base+'/requirements/'+row['id'],json={'status':'confirmed','text':'原需求','version':1}).json()
+    revision=client.post(base+'/requirements/'+row['id']+'/revisions',json={'text':'修订需求','version':row['version']}).json()
+    assert client.post(base+'/materials/'+source+'/withdraw',json={'state_version':0,'confirm':True}).status_code==200
+    result=client.post(base+'/requirement-revisions/'+revision['id']+'/decision',json={'decision':'accept'})
+    assert result.status_code==409 and result.json()['error']['code']=='MATERIAL_WITHDRAWN'
+    assert client.get(base+'/requirements/'+row['id']+'/revisions').json()[0]['status']=='pending'
+
+def test_word_has_updatable_toc_and_material_version(client):
+    import io, zipfile
+    project, _, _, draft=make_review_fixture(client)
+    result=client.post(f'/api/v1/projects/{project}/proposals/{draft}/export',json={'version':1,'kind':'draft'})
+    assert result.status_code==200
+    with zipfile.ZipFile(io.BytesIO(result.content)) as doc:
+        xml=doc.read('word/document.xml').decode('utf-8')
+        assert 'TOC' in xml and 'w:fldSimple' in xml
+        assert '访谈.txt（资料 1）· 第 1 版' in xml
+
+def test_worklist_and_activity_list_recorded_actions(client):
+    project=client.post('/api/v1/projects',json={'name':'虚构待办'}).json()['id']
+    base=f'/api/v1/projects/{project}'
+    requirement=client.post(base+'/requirements/manual',json={'text':'待确认的人工需求'}).json()
+    work=client.get('/api/v1/worklist')
+    assert work.status_code==200 and any(item['project_id']==project and item['kind']=='requirements' for item in work.json())
+    client.patch(base+'/requirements/'+requirement['id'],json={'status':'confirmed','text':requirement['text'],'version':1})
+    activity=client.get(base+'/activity')
+    assert activity.status_code==200 and any(item['object_type']=='人工需求' for item in activity.json())
+    assert '待确认的人工需求' not in activity.text
+    assert not any(item['project_id']==project and item['kind']=='requirements' for item in client.get('/api/v1/worklist').json())
+
+def test_project_template_and_case_are_authorized_versioned_and_revocable(client, monkeypatch):
+    import json
+    import app.database as database
+    import app.models as models
+    import app.main as main
+    monkeypatch.setenv('DEEPSEEK_API_KEY','fake-for-test')
+    project,other,_,_=make_review_fixture(client)
+    base=f'/api/v1/projects/{project}'
+    template=client.post(base+'/materials',files={'file':('模板.md',b'## Overview\nTemplate guidance','text/markdown')}).json()
+    case=client.post(base+'/materials',files={'file':('案例.txt',b'Fictional example case','text/plain')}).json()
+    with database.SessionLocal() as db:
+        from sqlalchemy import select
+        baseline=db.scalar(select(models.Baseline.id).where(models.Baseline.project_id==project))
+    outlines=client.get(base+'/outlines',params={'baseline_id':baseline,'template_id':template['id']})
+    assert outlines.status_code==200 and outlines.json()['defaults'][0]['title']=='Overview'
+    assert client.get(f'/api/v1/projects/{other}/outlines',params={'baseline_id':baseline,'template_id':template['id']}).status_code==404
+    def complete(draft_id):
+        with database.SessionLocal() as db:
+            draft=db.get(models.ProposalDraft,draft_id);draft.status='completed';draft.content='# 虚构方案\n\n## Overview\n\n内容。';db.commit()
+    monkeypatch.setattr(main,'run_proposal',complete)
+    body={'baseline_id':baseline,'template_id':template['id'],'case_ids':[case['id']],'confirm_external_use':True}
+    response=client.post(base+'/proposals',json=body)
+    assert response.status_code==202
+    draft_id=response.json()['id']
+    with database.SessionLocal() as db:
+        draft=db.get(models.ProposalDraft,draft_id)
+        assert draft.template_snapshot=='## Overview\nTemplate guidance'
+        inputs=json.loads(draft.input_snapshot)
+        assert inputs['选用的参考案例（仅作写法参考，不能推定为本项目事实）'][0]['资料内容']=='Fictional example case'
+        from sqlalchemy import select
+        sources=list(db.scalars(select(models.ProposalInputSource).where(models.ProposalInputSource.draft_id==draft_id)))
+        assert {(x.material_id,x.kind,x.version) for x in sources}=={(template['id'],'template',1),(case['id'],'case',1)}
+    assert client.post(base+'/proposals/'+draft_id+'/review',json={'version':1,'action':'submit'}).status_code==200
+    impact=client.get(base+'/materials/'+case['id']+'/impact').json()
+    assert impact['proposals']==1
+    assert client.post(base+'/materials/'+case['id']+'/withdraw',json={'state_version':0,'confirm':True}).status_code==200
+    assert client.get(base+'/proposals/'+draft_id+'/review').json()['status']=='needs_review'
+    assert client.post(base+'/proposals',json=body).status_code==409
+
+def test_new_source_version_marks_existing_approval_for_review(client):
+    project, _, material, draft=make_review_fixture(client)
+    base=f'/api/v1/projects/{project}'
+    url=base+'/proposals/'+draft
+    assert client.post(url+'/review',json={'version':1,'action':'submit'}).status_code==200
+    approval={'version':1,'action':'approve','note':'已核对','other_critical_checked':True,'decisions':[{'question_id':'问题一','classification':'critical','disposition':'resolved','reason':'已处理'}]}
+    assert client.post(url+'/review',json=approval).status_code==200
+    updated=client.post(base+'/materials/'+material+'/versions',files={'file':('新访谈.txt','更新后的虚构资料。'.encode(),'text/plain')})
+    assert updated.status_code==201
+    assert client.get(url+'/review').json()['status']=='needs_review'
+    assert client.post(url+'/export',json={'version':1,'kind':'approved'}).status_code==409
+    assert client.get(base+'/materials/'+material+'/original').status_code==200
+
+def test_proposal_template_and_case_reject_other_project_materials(client,monkeypatch):
+    import app.database as database
+    import app.models as models
+    from sqlalchemy import select
+    monkeypatch.setenv('DEEPSEEK_API_KEY','fake-for-test')
+    project,other,_,_=make_review_fixture(client)
+    foreign=client.post(f'/api/v1/projects/{other}/materials',files={'file':('private.txt',b'fictional private sample','text/plain')}).json()['id']
+    with database.SessionLocal() as db:
+        baseline=db.scalar(select(models.Baseline.id).where(models.Baseline.project_id==project))
+    url=f'/api/v1/projects/{project}/proposals'
+    for payload in ({'template_id':foreign,'case_ids':[]},{'template_id':'demo-v1','case_ids':[foreign]}):
+        result=client.post(url,json={'baseline_id':baseline,'confirm_external_use':True,**payload})
+        assert result.status_code==404
+    with database.SessionLocal() as db:
+        assert len(list(db.scalars(select(models.ProposalDraft).where(models.ProposalDraft.project_id==project))))==1

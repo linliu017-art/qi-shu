@@ -72,3 +72,4 @@ from docx import Document
 assert any('已审核方案' in p.text for p in Document(sys.argv[1]).paragraphs)
 PYCODE
 echo '重启后已找回项目、资料、需求清单、模拟初稿及审核记录；模拟 Word 可读取。'
+bash "$ROOT/scripts/restart-check-multi.sh"

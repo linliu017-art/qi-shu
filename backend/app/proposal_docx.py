@@ -80,11 +80,18 @@ def build_docx(content, kind, version, questions, material_names, citations, bas
     doc.add_paragraph('审核状态：草稿，未审核' if kind == 'draft' else '审核状态：已审核（本机试用）')
     doc.add_heading('目录', 1)
     headings = [(int(token.tag[1:]), inline_text(tokens[index + 1])) for index, token in enumerate(tokens[:-1]) if token.type == 'heading_open' and tokens[index + 1].type == 'inline' and int(token.tag[1:]) <= 3]
-    for level, title in headings:
-        line = doc.add_paragraph(clean_text(title, material_names))
-        line.paragraph_format.left_indent = Cm((level - 1) * .6)
-    if questions: doc.add_paragraph('需求清单中的问题处理情况' if kind == 'approved' else '需求清单中的未解决事项')
-    if citations: doc.add_paragraph('资料来源')
+    # Keep a readable initial list inside the Word field; office software can update it.
+    toc_paragraph = doc.add_paragraph()
+    toc = OxmlElement('w:fldSimple')
+    toc.set(qn('w:instr'), 'TOC \\o "1-3" \\h \\z \\u')
+    toc_titles = [clean_text(title, material_names) for _, title in headings]
+    if questions: toc_titles.append('需求清单中的问题处理情况' if kind == 'approved' else '需求清单中的未解决事项')
+    if citations: toc_titles.append('资料来源')
+    for index, title in enumerate(toc_titles):
+        run = OxmlElement('w:r')
+        if index: run.append(OxmlElement('w:br'))
+        text = OxmlElement('w:t'); text.text = title; run.append(text); toc.append(run)
+    toc_paragraph._p.append(toc)
     settings = doc.settings.element
     update = OxmlElement('w:updateFields'); update.set(qn('w:val'), 'true'); settings.append(update)
     footer = section.footer.paragraphs[0]
@@ -92,7 +99,7 @@ def build_docx(content, kind, version, questions, material_names, citations, bas
     page = OxmlElement('w:fldSimple'); page.set(qn('w:instr'), 'PAGE')
     page_run = OxmlElement('w:r'); page_text = OxmlElement('w:t'); page_text.text = '1'; page_run.append(page_text); page.append(page_run); footer._p.append(page)
     footer.add_run(' 页')
-    i = 0; list_styles = []
+    i = 0; list_styles = []; metadata_level = None
     while i < len(tokens):
         token = tokens[i]
         if token.type in ('bullet_list_open', 'ordered_list_open'):
@@ -101,9 +108,15 @@ def build_docx(content, kind, version, questions, material_names, citations, bas
             if list_styles: list_styles.pop()
         elif token.type == 'heading_open' and i+1 < len(tokens) and tokens[i+1].type == 'inline':
             level = max(1, min(6, int(token.tag[1:])))
+            heading = inline_text(tokens[i+1]).strip()
+            if metadata_level is not None and level <= metadata_level: metadata_level = None
+            if re.fullmatch(r'(?:文档|文件|方案)(?:基本)?信息', heading): metadata_level = level
             paragraph = doc.add_heading(level=level); add_inline(paragraph, tokens[i+1], material_names); i += 1
         elif token.type == 'paragraph_open' and i+1 < len(tokens) and tokens[i+1].type == 'inline':
             paragraph = doc.add_paragraph(style=list_styles[-1] if list_styles else None)
+            original = inline_text(tokens[i+1])
+            if kind == 'approved' and metadata_level is not None and re.search(r'(文档状态|审核状态|尚未审核|未审核|待审核|方案初稿|文档版本)', original):
+                paragraph.add_run('原稿生成时记录（当前状态以文首为准）：')
             add_inline(paragraph, tokens[i+1], material_names); i += 1
         elif token.type in ('fence', 'code_block'):
             doc.add_paragraph(clean_text(token.content, material_names))
@@ -149,7 +162,7 @@ def build_docx(content, kind, version, questions, material_names, citations, bas
         for name, quote in citations:
             if quote and quote not in grouped[name]: grouped[name].append(quote)
         for name, quotes in grouped.items():
-            doc.add_paragraph(name + '（资料版本未记录）', style='List Bullet')
+            doc.add_paragraph(name if re.search(r'第\s*\d+\s*版', name) else name + '（资料版本未记录）', style='List Bullet')
             for quote in quotes: doc.add_paragraph('原文摘录：' + quote)
     stream = io.BytesIO(); doc.save(stream)
     return stream.getvalue()
