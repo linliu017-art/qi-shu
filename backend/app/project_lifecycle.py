@@ -4,7 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .authorization import can_access
-from .models import AnalysisTask, ProjectLifecycle, ProjectLifecycleEvent, ProposalDraft, QueuedJob
+from .models import AnalysisTask, ProductResearchTask, ProjectLifecycle, ProjectLifecycleEvent, ProposalDraft, QueuedJob
 
 
 class LifecycleError(Exception):
@@ -35,6 +35,7 @@ def transition(db: Session, project_id: str, actor_id: str, action: str, version
         running = db.scalar(select(func.count()).select_from(QueuedJob).where(QueuedJob.project_id == project_id, QueuedJob.status.in_(['queued', 'running'])))
         running += db.scalar(select(func.count()).select_from(AnalysisTask).where(AnalysisTask.project_id == project_id, AnalysisTask.status.in_(['pending', 'running'])))
         running += db.scalar(select(func.count()).select_from(ProposalDraft).where(ProposalDraft.project_id == project_id, ProposalDraft.status.in_(['pending', 'running'])))
+        running += db.scalar(select(func.count()).select_from(ProductResearchTask).where(ProductResearchTask.project_id == project_id, ProductResearchTask.status.in_(['pending', 'running'])))
         if running:
             raise LifecycleError('项目仍有未结束任务，请先处理。')
     before = state if action == 'trash' else None

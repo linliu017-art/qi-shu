@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .backup import create_backup
 from .models import (AdditionalCitation, AnalysisTask, Baseline, BaselineFacts, BaselineQuestions,
     ExtractedFact, FactReview, FactReviewEvent, Material, MaterialOriginal, MaterialVersion, MaterialLabel, MaterialStateEvent, ManualRequirement, ManualRequirementEvent, RequirementRevisionSuggestion, MembershipEvent,
-    ModelConsent, OpenQuestion, Project, ProjectLifecycle, ProjectLifecycleEvent, ProjectMember,
+    ModelConsent, OpenQuestion, Project, ProductWork, ProductWorkRevision, ProductWorkStatusEvent, ProductWorkLink, ProductSectionLink, CompetitorImage, CompetitorComparison, CompetitorComparisonRevision, ProductResearchTask, ProductRequirement, ProductRequirementEvent, ProjectLifecycle, ProjectLifecycleEvent, ProjectMember,
     ProposalDraft, ProposalInputSource, ProposalOutline, ProposalOutlineLink, SectionEdit, ConsistencyCheck, ConsistencyIssue, ProposalExportEvent, ProposalPricing, ProposalReviewEvent, ProposalRevision, PurgeJob,
     QuestionDecision, QueuedJob, Requirement, RequirementDecision, TaskAttempt, TaskAttemptTiming,
     TaskConfig, TaskModelChange, TaskPricing, TaskSegment, UserAccount)
@@ -25,7 +25,8 @@ def _eligible(db: Session, actor_id: str, project_id: str) -> Project:
     jobs = db.scalar(select(func.count()).select_from(QueuedJob).where(QueuedJob.project_id == project_id, QueuedJob.status.in_(['queued', 'running'])))
     tasks = db.scalar(select(func.count()).select_from(AnalysisTask).where(AnalysisTask.project_id == project_id, AnalysisTask.status.in_(['pending', 'running'])))
     drafts = db.scalar(select(func.count()).select_from(ProposalDraft).where(ProposalDraft.project_id == project_id, ProposalDraft.status.in_(['pending', 'running'])))
-    if jobs or tasks or drafts:
+    research = db.scalar(select(func.count()).select_from(ProductResearchTask).where(ProductResearchTask.project_id == project_id, ProductResearchTask.status.in_(['pending', 'running'])))
+    if jobs or tasks or drafts or research:
         raise PurgeError('项目仍有未结束任务。')
     return project
 
@@ -35,7 +36,9 @@ def impact(db: Session, actor_id: str, project_id: str) -> dict:
     return {'project_id': project.id, 'name': project.name,
             'materials': db.scalar(select(func.count()).select_from(Material).where(Material.project_id == project_id)),
             'requirements': db.scalar(select(func.count()).select_from(Requirement).where(Requirement.project_id == project_id)),
-            'proposals': db.scalar(select(func.count()).select_from(ProposalDraft).where(ProposalDraft.project_id == project_id))}
+            'proposals': db.scalar(select(func.count()).select_from(ProposalDraft).where(ProposalDraft.project_id == project_id)),
+            'product_work': db.scalar(select(func.count()).select_from(ProductWork).where(ProductWork.project_id == project_id)),
+            'product_requirements': db.scalar(select(func.count()).select_from(ProductRequirement).where(ProductRequirement.project_id == project_id))}
 
 
 def purge(db: Session, data_dir: Path, backup_root: Path, actor_id: str, project_id: str, confirmed_name: str) -> str:
@@ -60,6 +63,8 @@ def purge(db: Session, data_dir: Path, backup_root: Path, actor_id: str, project
         fact_ids = select(ExtractedFact.id).where(ExtractedFact.project_id == project_id)
         baseline_ids = select(Baseline.id).where(Baseline.project_id == project_id)
         draft_ids = select(ProposalDraft.id).where(ProposalDraft.project_id == project_id)
+        work_ids = select(ProductWork.id).where(ProductWork.project_id == project_id)
+        product_requirement_ids = select(ProductRequirement.id).where(ProductRequirement.project_id == project_id)
         attempt_ids = select(TaskAttempt.id).where(TaskAttempt.task_id.in_(task_ids))
         files = list(db.scalars(select(MaterialOriginal.filename_on_disk).where(MaterialOriginal.material_id.in_(material_ids))))
         for name in files:
@@ -70,6 +75,17 @@ def purge(db: Session, data_dir: Path, backup_root: Path, actor_id: str, project
         db.flush()
         job_id = job.id
         for model, criterion in (
+            (ProductResearchTask, ProductResearchTask.work_id.in_(work_ids)),
+            (ProductWorkStatusEvent, ProductWorkStatusEvent.work_id.in_(work_ids)),
+            (ProductWorkLink, ProductWorkLink.work_id.in_(work_ids)),
+            (ProductSectionLink, ProductSectionLink.work_id.in_(work_ids)),
+            (CompetitorImage, CompetitorImage.work_id.in_(work_ids)),
+            (CompetitorComparisonRevision, CompetitorComparisonRevision.work_id.in_(work_ids)),
+            (CompetitorComparison, CompetitorComparison.work_id.in_(work_ids)),
+            (ProductRequirementEvent, ProductRequirementEvent.requirement_id.in_(product_requirement_ids)),
+            (ProductRequirement, ProductRequirement.project_id == project_id),
+            (ProductWorkRevision, ProductWorkRevision.work_id.in_(work_ids)),
+            (ProductWork, ProductWork.project_id == project_id),
             (TaskAttemptTiming, TaskAttemptTiming.attempt_id.in_(attempt_ids)),
             (TaskAttempt, TaskAttempt.task_id.in_(task_ids)), (TaskSegment, TaskSegment.task_id.in_(task_ids)),
             (TaskConfig, TaskConfig.task_id.in_(task_ids)), (TaskPricing, TaskPricing.task_id.in_(task_ids)),

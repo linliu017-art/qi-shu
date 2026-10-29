@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from uuid import uuid4
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, text
+from sqlalchemy import LargeBinary, Boolean, CheckConstraint, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -135,6 +135,134 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200))
     background: Mapped[str] = mapped_column(Text, default='')
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class ProductWork(Base):
+    __tablename__ = 'product_work'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    creator_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey('projects.id'), index=True, nullable=True)
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default='draft', nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default='', nullable=False)
+    version: Mapped[int] = mapped_column(default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class ProductWorkRevision(Base):
+    __tablename__ = 'product_work_revisions'
+    __table_args__ = (UniqueConstraint('work_id', 'version', name='uq_product_work_revision'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'), index=True, nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class ProductWorkStatusEvent(Base):
+    __tablename__ = 'product_work_status_events'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'), index=True, nullable=False)
+    old_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    new_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class ProductWorkLink(Base):
+    __tablename__ = 'product_work_links'
+    __table_args__ = (UniqueConstraint('work_id', 'target_type', 'target_id', name='uq_product_work_link'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'), index=True, nullable=False)
+    target_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    target_version: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class CompetitorImage(Base):
+    __tablename__ = 'competitor_images'
+    id: Mapped[str] = mapped_column(String(36),primary_key=True,default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'),index=True,nullable=False)
+    filename: Mapped[str] = mapped_column(String(200),nullable=False)
+    media_type: Mapped[str] = mapped_column(String(30),nullable=False)
+    image_bytes: Mapped[bytes] = mapped_column(LargeBinary,nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=now,nullable=False)
+
+class CompetitorComparison(Base):
+    __tablename__ = 'competitor_comparisons'
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'), primary_key=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default='{}')
+
+class CompetitorComparisonRevision(Base):
+    __tablename__ = 'competitor_comparison_revisions'
+    __table_args__ = (UniqueConstraint('work_id','version',name='uq_competitor_comparison_revision'),)
+    id: Mapped[str] = mapped_column(String(36),primary_key=True,default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'),index=True,nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    content: Mapped[str] = mapped_column(Text,nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=now,nullable=False)
+
+class ProductSectionLink(Base):
+    __tablename__ = 'product_section_links'
+    __table_args__ = (UniqueConstraint('work_id', 'source_id', 'section_index', name='uq_product_section_link'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'), index=True, nullable=False)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    source_version: Mapped[int] = mapped_column(nullable=False)
+    section_index: Mapped[int] = mapped_column(nullable=False)
+    section_title: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class ProductRequirement(Base):
+    __tablename__ = 'product_requirements'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey('projects.id'), index=True, nullable=True)
+    creator_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default='', nullable=False)
+    priority: Mapped[str] = mapped_column(String(20), default='unset', nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default='clarify', nullable=False)
+    assignee_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    iteration: Mapped[str] = mapped_column(String(200), default='', nullable=False)
+    iteration_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    blocked_reason: Mapped[str] = mapped_column(Text, default='', nullable=False)
+    source_type: Mapped[str] = mapped_column(String(30), default='manual', nullable=False)
+    source_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_version: Mapped[int | None] = mapped_column(nullable=True)
+    source_snapshot: Mapped[str] = mapped_column(Text, default='', nullable=False)
+    version: Mapped[int] = mapped_column(default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class ProductRequirementEvent(Base):
+    __tablename__ = 'product_requirement_events'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    requirement_id: Mapped[str] = mapped_column(ForeignKey('product_requirements.id'), index=True, nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    before: Mapped[str] = mapped_column(Text, nullable=False)
+    after: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
+
+class ProductResearchTask(Base):
+    __tablename__ = 'product_research_tasks'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str] = mapped_column(ForeignKey('product_work.id'), index=True, nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey('projects.id'), nullable=True)
+    base_version: Mapped[int] = mapped_column(nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_refs: Mapped[str] = mapped_column(Text, default='[]', nullable=False)
+    edit_spec: Mapped[str] = mapped_column(Text, default='{}', nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(40), default='product_research_v1', nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default='pending', nullable=False)
+    result: Mapped[str] = mapped_column(Text, default='', nullable=False)
+    error: Mapped[str] = mapped_column(String(500), default='', nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(nullable=True)
+    elapsed_ms: Mapped[int | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, nullable=False)
 
 class Material(Base):
     __tablename__ = 'materials'

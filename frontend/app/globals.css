@@ -399,3 +399,30 @@ body:has(.workspace-main) .session-bar { position:fixed; top:48px; right:max(48p
   .project-workspace { grid-template-areas:'sidebar' 'toolbar' 'content' 'overview'; grid-template-rows:auto; }
   .project-workspace.no-project { grid-template-areas:'toolbar' 'content'; }
 }
+
+.product-work-area { padding: 24px; max-width: 1440px; margin: 0 auto; }
+.product-work-layout { display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); gap: 20px; }
+.product-work-list, .product-work-editor { background: white; border-radius: 18px; padding: 20px; min-width: 0; }
+.product-work-list label, .product-work-editor label { display: grid; gap: 8px; margin-bottom: 16px; }
+.product-work-list input, .product-work-list select, .product-work-editor input, .product-work-editor select, .product-work-editor textarea { width: 100%; }
+.product-work-items { display: grid; gap: 8px; margin-top: 18px; }
+.product-work-items button { text-align: left; }
+.product-work-items small { display: block; opacity: .7; }
+@media (max-width: 700px) { .product-work-area { padding: 12px; } .product-work-layout { grid-template-columns: 1fr; } }
+.product-work-entry { position: fixed; left: 48px; top: 310px; z-index: 5; }
+@media (max-width: 700px) { .product-work-entry { left: 30px; top: 275px; } }
+.product-research { border-top: 1px solid #e5eaf3; margin-top: 24px; padding-top: 16px; }
+.product-research article { border: 1px solid #e5eaf3; border-radius: 12px; margin-top: 14px; padding: 14px; }
+.research-result { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; max-height: 24rem; overflow: auto; }
+.candidate-item { border: 1px solid #e5eaf3; border-radius: 12px; padding: 12px; margin: 12px 0; }
+.requirements-board { background:#fff; border-radius:18px; padding:20px; margin-top:20px; }
+.requirement-filters,.requirement-fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:16px 0; }
+.requirement-filters label,.requirement-editor label { display:grid; gap:8px; }
+.requirement-editor { margin-top:24px; border-top:1px solid #e5eaf3; padding-top:20px; }
+.requirement-editor input,.requirement-editor select,.requirement-editor textarea,.requirement-filters input,.requirement-filters select { width:100%; }
+.requirement-table-wrap { overflow-x:auto; max-width:100%; margin-top:20px; }
+.requirement-table-wrap table { min-width:850px; width:100%; border-collapse:collapse; }
+.requirement-table-wrap th,.requirement-table-wrap td { padding:10px; border-bottom:1px solid #e5eaf3; text-align:left; }
+/* 产品工作独立页没有侧边栏，保持与工作台一致的外侧留白。 */
+.workspace-main:has(> .product-work-area) { padding-left: 48px; }
+@media (max-width: 760px) { .workspace-main:has(> .product-work-area) { padding-left: 30px; } }

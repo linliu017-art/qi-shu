@@ -1,0 +1,14 @@
+'use client';
+import {useEffect,useState} from 'react';
+type Source={id:string;title:string;kind:string;project_id:string|null;version:number};
+type Section={index:number;title:string;level:number};
+type Link={id:string;label:string;source_version:number;state:string};
+async function api<T>(path:string,body?:object):Promise<T>{const r=await fetch('/api/v1'+path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:undefined);const d=await r.json();if(!r.ok)throw Error(d.error?.message||'操作失败');return d as T;}
+export default function AcceptanceSections({id,projectId,version,editable,dirty,onUpdated}:{id:string;projectId:string|null;version:number;editable:boolean;dirty:boolean;onUpdated:(v:unknown)=>void}){
+ const [sources,setSources]=useState<Source[]>([]),[links,setLinks]=useState<Link[]>([]),[sourceId,setSourceId]=useState(''),[sections,setSections]=useState<Section[]>([]),[index,setIndex]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);
+ useEffect(()=>{let live=true;Promise.all([api<Source[]>('/product-work'),api<Link[]>(`/acceptance/${id}/section-links`)]).then(([docs,refs])=>{if(live){setSources(docs.filter(d=>d.kind==='prd'&&d.project_id===projectId));setLinks(refs)}}).catch(e=>{if(live)setMessage(e.message)});return()=>{live=false}},[id,projectId,version]);
+ useEffect(()=>{let live=true;if(sourceId)api<Section[]>(`/product-work/${sourceId}/sections`).then(rows=>{if(live)setSections(rows)}).catch(e=>{if(live)setMessage(e.message)});return()=>{live=false}},[sourceId]);
+ async function change(path:string,body:object){setBusy(true);try{onUpdated(await api(path,body));setIndex('');setMessage('关联已更新。')}catch(e){setMessage(e instanceof Error?e.message:'操作失败')}finally{setBusy(false)}}
+ const source=sources.find(s=>s.id===sourceId);
+ return <section><h4>PRD 章节</h4><p>章节依据按所选版本记录，PRD 更新后请重新核对。</p>{links.map(l=><p key={l.id}>{l.label} · 版本 {l.source_version} · {l.state==='available'?'可用':l.state==='changed'?'已变更，请核对':'不可用'} {editable&&<button className="secondary" disabled={busy||dirty} onClick={()=>void change(`/acceptance/${id}/section-links/${l.id}/remove`,{version})}>解除</button>}</p>)}{editable&&<><label>选择 PRD<select value={sourceId} onChange={e=>{setSourceId(e.target.value);setIndex('');setSections([])}}><option value="">请选择</option>{sources.map(s=><option key={s.id} value={s.id}>{s.title}</option>)}</select></label><label>选择章节<select value={index} onChange={e=>setIndex(e.target.value)}><option value="">请选择</option>{sections.map(s=><option key={s.index} value={s.index}>{s.title}</option>)}</select></label><button disabled={busy||dirty||!source||index===''} onClick={()=>{if(source)void change(`/acceptance/${id}/section-links`,{version,source_id:source.id,source_version:source.version,section_index:Number(index)})}}>关联章节</button>{dirty&&<p>请先处理未保存的内容。</p>}</>}{message&&<p role="status">{message}</p>}</section>
+}

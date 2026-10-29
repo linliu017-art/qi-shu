@@ -9,7 +9,7 @@ from app.database import Base
 from app.membership import initialize_project_owner
 from app.models import (AdditionalCitation, AnalysisTask, Baseline, BaselineFacts, BaselineQuestions,
     ExtractedFact, FactReview, FactReviewEvent, Material, MaterialOriginal, MaterialVersion, MaterialStateEvent, ManualRequirement, ManualRequirementEvent, RequirementRevisionSuggestion, ModelConsent, OpenQuestion,
-    Project, ProposalDraft, ProposalInputSource, ProposalOutline, ProposalOutlineLink, ProposalExportEvent, ProposalPricing, ProposalReviewEvent, ProposalRevision, PurgeJob,
+    Project, ProductWork, ProductWorkRevision, ProductResearchTask, ProposalDraft, ProposalInputSource, ProposalOutline, ProposalOutlineLink, ProposalExportEvent, ProposalPricing, ProposalReviewEvent, ProposalRevision, PurgeJob,
     QuestionDecision, QueuedJob, Requirement, RequirementDecision, TaskAttempt, TaskAttemptTiming,
     TaskConfig, TaskModelChange, TaskPricing, TaskSegment, UserAccount)
 from app.project_lifecycle import transition
@@ -33,6 +33,12 @@ def test_confirmed_purge_keeps_other_project_and_verified_backup(tmp_path):
         initialize_project_owner(db, project, admin.id)
         initialize_project_owner(db, other, admin.id)
         db.commit()
+        work=ProductWork(creator_id=admin.id,project_id=project.id,kind='competitor',title='测试竞品',content='内容')
+        kept_work=ProductWork(creator_id=admin.id,project_id=other.id,kind='competitor',title='保留竞品',content='保留')
+        db.add_all([work,kept_work]);db.flush()
+        db.add(ProductWorkRevision(work_id=work.id,version=1,title='测试竞品',content='旧内容'))
+        db.add(ProductResearchTask(work_id=work.id,actor_id=admin.id,project_id=project.id,base_version=1,
+            goal='虚构目标',source_text='虚构资料',model='test',status='completed',result='候选',error=''))
         material = Material(project_id=project.id, filename='虚构.txt', text='虚构资料')
         db.add(material); db.flush()
         content = '虚构资料'.encode()
@@ -82,6 +88,7 @@ def test_confirmed_purge_keeps_other_project_and_verified_backup(tmp_path):
         project_id, other_id, material_id = project.id, other.id, material.id
         transition(db, project_id, admin.id, 'trash', 0, True)
         assert impact(db, admin.id, project_id)['materials'] == 1
+        assert impact(db, admin.id, project_id)['product_work'] == 1
         with pytest.raises(PurgeError):
             purge(db, data, data / 'backups' / 'manual', admin.id, project_id, '错误名称')
         assert db.get(Project, project_id) is not None
@@ -91,6 +98,7 @@ def test_confirmed_purge_keeps_other_project_and_verified_backup(tmp_path):
         assert job.status == 'completed'
         assert db.get(Project, project_id) is None
         assert db.get(Project, other_id).name == '保留项目'
+        assert db.get(ProductWork, kept_work.id).content == '保留'
         assert not (data / 'materials' / material_id).exists()
         backup_dir=data / 'backups' / 'manual' / job.backup_id
         verify_backup(backup_dir)
@@ -101,6 +109,8 @@ def test_confirmed_purge_keeps_other_project_and_verified_backup(tmp_path):
             assert backup_db.execute('SELECT COUNT(*) FROM material_versions').fetchone()[0] == 1
             assert backup_db.execute('SELECT COUNT(*) FROM manual_requirements').fetchone()[0] == 1
             assert backup_db.execute('SELECT COUNT(*) FROM requirement_revision_suggestions').fetchone()[0] == 1
+            assert backup_db.execute('SELECT COUNT(*) FROM product_work').fetchone()[0] == 2
+            assert backup_db.execute('SELECT COUNT(*) FROM product_research_tasks').fetchone()[0] == 1
     engine.dispose()
 
 

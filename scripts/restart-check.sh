@@ -16,6 +16,36 @@ start
 echo '测试服务启动。'
 RESULT="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/projects" -H 'Content-Type: application/json' -d '{"name":"重启恢复合成测试"}')"
 ID="$(printf '%s' "$RESULT" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+WORK="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-work" -H 'Content-Type: application/json' -d '{"title":"重启恢复竞品草稿"}')"
+WORK_ID="$(printf '%s' "$WORK" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+curl -fsS -X PUT "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID" -H 'Content-Type: application/json' -d '{"title":"重启恢复竞品草稿","content":"虚构来源和研究笔记","version":1}' > /dev/null
+curl -fsS -X PUT "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID/comparison" -H 'Content-Type: application/json' -d '{"version":2,"competitors":[{"id":"sample","name":"虚构竞品"}],"observations":[]}' > /dev/null
+"$ROOT/backend/.venv/bin/python" - "$TMPDIR_TASK/screenshot.png" <<'PYIMAGE'
+from PIL import Image
+import sys
+Image.new('RGB',(8,8),'blue').save(sys.argv[1],format='PNG')
+PYIMAGE
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID/images" -F 'version=3' -F "file=@$TMPDIR_TASK/screenshot.png;filename=sample.png;type=image/png" > /dev/null
+INITIATION="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-work" -H 'Content-Type: application/json' -d '{"title":"重启恢复立项报告","kind":"initiation"}')"
+INITIATION_ID="$(printf '%s' "$INITIATION" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+PRD="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-work" -H 'Content-Type: application/json' -d '{"title":"重启恢复PRD","kind":"prd"}')"
+PRD_ID="$(printf '%s' "$PRD" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+curl -fsS -X PUT "http://127.0.0.1:$PORT/api/v1/product-work/$PRD_ID" -H 'Content-Type: application/json' -d '{"title":"重启恢复PRD","content":"# 背景\n虚构背景\n\n# 目标\n虚构目标","version":1}' > /dev/null
+PRODUCT_REQ="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-requirements" -H 'Content-Type: application/json' -d '{"title":"重启恢复产品需求"}')"
+PRODUCT_REQ_ID="$(printf '%s' "$PRODUCT_REQ" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+curl -fsS -X PUT "http://127.0.0.1:$PORT/api/v1/product-requirements/$PRODUCT_REQ_ID" -H 'Content-Type: application/json' -d '{"title":"重启恢复产品需求","status":"doing","version":1}' > /dev/null
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-work/$INITIATION_ID/status" -H 'Content-Type: application/json' -d '{"status":"approved","version":1}' > /dev/null
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/product-work/$INITIATION_ID/links" -H 'Content-Type: application/json' -d "{\"target_type\":\"competitor\",\"target_id\":\"$WORK_ID\",\"version\":2}" > /dev/null
+ACCEPTANCE="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/acceptance" -H 'Content-Type: application/json' -d '{"kind":"acceptance_test","title":"重启恢复验收"}')"
+ACCEPTANCE_ID="$(printf '%s' "$ACCEPTANCE" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/acceptance/$ACCEPTANCE_ID/items" -H 'Content-Type: application/json' -d '{"version":1,"title":"检查项","expected":"完成"}' > /dev/null
+STANDARD="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/acceptance" -H 'Content-Type: application/json' -d '{"kind":"acceptance_standard","title":"重启恢复标准"}')"
+STANDARD_ID="$(printf '%s' "$STANDARD" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/acceptance/$STANDARD_ID/section-links" -H 'Content-Type: application/json' -d "{\"source_id\":\"$PRD_ID\",\"source_version\":2,\"section_index\":0,\"version\":1}" > /dev/null
+ITERATION="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/iterations" -H 'Content-Type: application/json' -d '{"title":"重启恢复迭代"}')"
+ITERATION_ID="$(printf '%s' "$ITERATION" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/iterations/$ITERATION_ID/feedback" -H 'Content-Type: application/json' -d '{"version":1,"text":"虚构反馈"}' > /dev/null
+curl -fsS -X PUT "http://127.0.0.1:$PORT/api/v1/product-requirements/$PRODUCT_REQ_ID" -H 'Content-Type: application/json' -d "{\"title\":\"重启恢复产品需求\",\"status\":\"doing\",\"iteration_id\":\"$ITERATION_ID\",\"version\":2}" > /dev/null
 printf '虚构访谈资料：需要统一台账。' > "$TMPDIR_TASK/sample.txt"
 MATERIAL="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/projects/$ID/materials" -F "file=@$TMPDIR_TASK/sample.txt;filename=sample.txt;type=text/plain")"
 MATERIAL_ID="$(printf '%s' "$MATERIAL" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
@@ -54,9 +84,38 @@ curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/projects/$ID/proposals/$PROPOSA
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/projects/$ID/proposals/$PROPOSAL_ID/review" -H 'Content-Type: application/json' -d '{"version":2,"action":"approve","note":"模拟审核通过","decisions":[],"other_critical_checked":true}' > /dev/null
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/projects/$ID/proposals/$PROPOSAL_ID/export" -H 'Content-Type: application/json' -d '{"version":2,"kind":"approved"}' > "$TMPDIR_TASK/synthetic.docx"
 echo '已确认人工构造的测试需求并保存清单；未调用模型。'
+RESEARCH_ID="$(cd "$ROOT/backend" && QISHU_DATA_DIR="$TMPDIR_TASK" DEEPSEEK_API_KEY='' .venv/bin/python - "$WORK_ID" <<'PYCODE'
+import sys
+from app.database import SessionLocal
+from app.models import ProductResearchTask
+with SessionLocal() as db:
+    task = ProductResearchTask(work_id=sys.argv[1], actor_id='local-user', base_version=4,
+        goal='虚构研究目标', source_text='虚构资料', model='deepseek-flash',
+        prompt_version='product_research_v1', status='running', result='', error='')
+    db.add(task); db.commit(); print(task.id)
+PYCODE
+)"
 kill "$PID"; wait "$PID" || true; PID=''
 echo '测试服务已停止。'
 start
+curl -fsS "http://127.0.0.1:$PORT/api/v1/acceptance/$STANDARD_ID/section-links" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["state"]=="available" and "背景" in x[0]["label"]'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/iterations/$ITERATION_ID" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["title"]=="重启恢复迭代" and x["data"]["feedback"][0]["text"]=="虚构反馈" and x["version"]==2'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/acceptance/$ACCEPTANCE_ID" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["title"]=="重启恢复验收" and x["data"]["items"][0]["expected"]=="完成" and x["version"]==2'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["title"]=="重启恢复竞品草稿" and x["content"]=="虚构来源和研究笔记" and x["version"]==4'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID/images" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["filename"]=="sample.png"'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID/comparison" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["competitors"][0]["name"]=="虚构竞品"'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$WORK_ID/research" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; rows=json.load(sys.stdin); assert any(x["id"]==sys.argv[1] and x["status"]=="interrupted" and x["goal"]=="虚构研究目标" for x in rows)' "$RESEARCH_ID"
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$INITIATION_ID" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["status"]=="approved" and x["kind"]=="initiation" and x["version"]==3'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$INITIATION_ID/status-history" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows)==1 and rows[0]["new_status"]=="approved"'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$INITIATION_ID/links" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows)==1 and rows[0]["state"]=="available"'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-work/$PRD_ID" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["kind"]=="prd" and x["version"]==2 and "虚构背景" in x["content"]'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-requirements/$PRODUCT_REQ_ID" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; x=json.load(sys.stdin); assert x["title"]=="重启恢复产品需求" and x["status"]=="doing" and x["iteration"]=="重启恢复迭代" and x["iteration_id"] and x["version"]==3'
+curl -fsS "http://127.0.0.1:$PORT/api/v1/product-requirements/$PRODUCT_REQ_ID/history" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows)==2 and any(r["after"]["status"]=="doing" for r in rows) and any(r["after"].get("iteration")=="重启恢复迭代" for r in rows)'
+echo '重启后已找回产品工作草稿。'
+echo '重启后研究任务标记为中断，输入记录保留，未自动重复调用。'
+echo '重启后立项状态、变更记录和关联依据保留。'
+echo '重启后 PRD 内容和版本保留。'
+echo '重启后产品需求状态及变更记录保留。'
 curl -fsS "http://127.0.0.1:$PORT/api/v1/projects" | "$ROOT/backend/.venv/bin/python" -c 'import json,sys; rows=json.load(sys.stdin); assert any(x["id"]==sys.argv[1] and x["name"]=="重启恢复合成测试" for x in rows)' "$ID"
 curl -fsS "http://127.0.0.1:$PORT/api/v1/projects/$ID/materials/$MATERIAL_ID/original" > "$TMPDIR_TASK/recovered.txt"
 cmp "$TMPDIR_TASK/sample.txt" "$TMPDIR_TASK/recovered.txt"

@@ -116,6 +116,8 @@ class PurgeImpact(BaseModel):
     materials: int
     requirements: int
     proposals: int
+    product_work: int
+    product_requirements: int
 
 
 class PurgeInput(BaseModel):
